@@ -44,7 +44,8 @@ def baddbmm(bias, A, B, beta=1.0, alpha=1.0):
         raise RuntimeError(
             "baddbmm expects bias to have the same dtype and device as the matrices"
         )
-    if not _supported(A, B) and not (alpha == 0 and beta in (0, 1)):
+    supported = _supported(A, B, fused_bias=True, ignore_bias=beta == 0)
+    if not supported and not (alpha == 0 and beta in (0, 1)):
         return generic_baddbmm(bias, A, B, beta, alpha)
     if torch.is_grad_enabled() and (
         A.requires_grad or B.requires_grad or bias.requires_grad

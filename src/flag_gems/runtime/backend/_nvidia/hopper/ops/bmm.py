@@ -17,7 +17,7 @@ import triton
 import triton.language as tl
 
 from flag_gems.ops.bmm import bmm as generic_bmm
-from flag_gems.runtime import torch_device_fn
+from flag_gems.runtime import flagtune_enabled, torch_device_fn
 from flag_gems.utils.triton_version_utils import HAS_TLE_DEVICE_MESH
 
 try:
@@ -150,7 +150,7 @@ def _batch_mm(
     m = tl.program_id(0) * BM + tl.arange(0, BM)
     n = tl.program_id(1) * BN + tl.arange(0, BN)
     k = tl.arange(0, BK)
-    if M * am >= 2**31 or M * cm >= 2**31:
+    if M * max(am, cm, N) >= 2**31:
         m = m.to(tl.int64)
     if N * bn >= 2**31 or N * cn >= 2**31:
         n = n.to(tl.int64)
@@ -209,8 +209,18 @@ def _batch_tma(
         s = tle.shard_id(MESH, "cluster_x")
     else:
         s = 0
-    m = tile // (N // BN) * BM
-    n = tile % (N // BN) * BN
+    tiles_n = tl.cdiv(N, BN)
+    if SPLIT == 1 and M >= 256 and N >= 512:
+        # Visit nearby row tiles together so they reuse the same B tile in L2.
+        tiles_per_group = 8 * tiles_n
+        first_m = tile // tiles_per_group * 8
+        group_m = tl.minimum(tl.cdiv(M, BM) - first_m, 8)
+        in_group = tile % tiles_per_group
+        m = (first_m + in_group % group_m) * BM
+        n = in_group // group_m * BN
+    else:
+        m = tile // tiles_n * BM
+        n = tile % tiles_n * BN
     if TRAN:
         acc = tl.full((BN, BM), 0, tl.float32)
     else:
@@ -245,12 +255,29 @@ def _batch_tma(
                 peer = tle.remote(workspace, peer_id, scope=MESH)
                 v += tl.load(tle.gpu.local_ptr(peer, (rm, rn)))
         rows, cols = m + rm, n + rn
-        offsets = z * M * N + rows * N + cols
+        if B * M * N >= 2**31:
+            offsets = z.to(tl.int64) * M * N + rows.to(tl.int64) * N + cols
+        else:
+            offsets = z * M * N + rows * N + cols
         bias_offsets = (
             z.to(tl.int64) * CB + rows.to(tl.int64) * CM + cols.to(tl.int64) * CN
         )
+        mask = True
+        if M % BM:
+            mask = mask & (rows < M)
+        if N % BN:
+            mask = mask & (cols < N)
         _store_result(
-            v, bias, out, offsets, True, bias_offsets, alpha, beta, HAS_BIAS, READ_BIAS
+            v,
+            bias,
+            out,
+            offsets,
+            mask,
+            bias_offsets,
+            alpha,
+            beta,
+            HAS_BIAS,
+            READ_BIAS,
         )
     if SPLIT > 1:
         # Keep all peer CTAs resident until rank zero has read their partials.
@@ -258,20 +285,27 @@ def _batch_tma(
 
 
 def _can_tma(A, B, batch, m, n, k):
-    # Fold packed batches into the row dimension of a 2-D tensor map.
-    # Descriptor coordinates and workspace offsets use signed 32-bit indices.
+    # Fold packed batches into the leading dimension of a 2-D tensor map.
+    # A matrix tail may then load unused rows from the next batch. These
+    # lanes cannot affect valid dot products and are masked at the store.
     return (
         TensorDescriptor is not None
-        and 1 <= batch <= 16
-        and (m >= 64 or bool(_CLUSTER_MESH))
-        and 32 <= m <= 512
-        and m % 32 == 0
-        and 128 <= n <= 512
-        and n % 64 == 0
-        and 1024 <= k <= 8192
-        and k % 128 == 0
+        and 1 <= batch <= 65535
+        and (
+            m >= 8
+            and m * n >= 4096
+            or 0 < m <= 4
+            and n >= 2048
+            and (m > 1 or n >= 4096 or B.stride(1) != 1)
+        )
+        and 16 <= n
+        and 512 <= k
+        and k % 64 == 0
+        and max(batch * m, batch * n, batch * k) < 2**31
         and A.stride() == (m * k, k, 1)
-        and B.stride() in ((k * n, n, 1), (k * n, 1, k))
+        and (
+            B.stride() == (k * n, 1, k) or (n % 8 == 0 and B.stride() == (k * n, n, 1))
+        )
         and A.data_ptr() % 16 == 0
         and B.data_ptr() % 16 == 0
     )
@@ -281,7 +315,18 @@ def _launch_tma(A, B, out, bias, alpha, beta, bias_strides, has_bias):
     batch, m, k = A.shape
     n = B.size(2)
     nt = B.stride(1) == 1
-    if m < 64:
+    keep_small_tuning = (
+        batch <= 16
+        and 32 <= m <= 512
+        and m % 32 == 0
+        and 128 <= n <= 512
+        and n % 64 == 0
+        and 1024 <= k <= 8192
+        and k % 128 == 0
+        and (m >= 64 or bool(_CLUSTER_MESH))
+    )
+    warps = 4
+    if keep_small_tuning and m < 64:
         bm, bn, bk = (16 if batch <= 2 or (batch <= 4 and nt) else 32), 64, 128
         trans_dot = True
         blocks = k // bk
@@ -290,7 +335,7 @@ def _launch_tma(A, B, out, bias, alpha, beta, bias_strides, has_bias):
         if nt and batch >= 4 and k % 512 == 0:
             # Two deeper K partitions keep transposed loads contiguous.
             bm, bk, splits, stages = 32, 256, 2, 4
-    else:
+    elif keep_small_tuning:
         # As the batch grows the same tile grid spans more Hopper SMs.
         # Widen tiles once there is enough parallel work to cover the device.
         tile_count = batch * (m // 64) * (n // 64)
@@ -303,6 +348,13 @@ def _launch_tma(A, B, out, bias, alpha, beta, bias_strides, has_bias):
             bk = 256 if k % 256 == 0 else 128
             stages, trans_dot = 4, bm < 64
         splits = 1
+    else:
+        bm, bn, bk, stages, warps, trans_dot = _tma_tile(batch, m, n, k)
+        splits = 1
+        tiles = batch * triton.cdiv(m, bm) * triton.cdiv(n, bn)
+        if _CLUSTER_MESH and tiles < 64 and k >= 1024:
+            blocks = k // bk
+            splits = min(4, blocks & -blocks)
     ad = TensorDescriptor(A, [batch * m, k], [k, 1], [bm, bk])
     width = k if nt else n
     height = n if nt else k
@@ -310,7 +362,7 @@ def _launch_tma(A, B, out, bias, alpha, beta, bias_strides, has_bias):
         B, [batch * height, width], [width, 1], [bn, bk] if nt else [bk, bn]
     )
     read_bias = has_bias and beta != 0
-    tiles = (m // bm) * (n // bn)
+    tiles = triton.cdiv(m, bm) * triton.cdiv(n, bn)
     grid = (
         (tiles * batch, 1, 1)
         if splits > 1 and not nt and batch >= 4
@@ -338,11 +390,39 @@ def _launch_tma(A, B, out, bias, alpha, beta, bias_strides, has_bias):
         trans_dot,
         _CLUSTER_MESH.get(splits),
         num_stages=stages,
-        num_warps=4,
+        num_warps=warps,
     )
 
 
-def _supported(A, B):
+def _tma_tile(batch, m, n, k):
+    # Use short M tiles for decode; broader N tiles raise arithmetic intensity
+    # once the launch already has a full wave of independent output tiles.
+    if m <= 4:
+        if n < 4096:
+            bk = 256 if k % 256 == 0 else (128 if k % 128 == 0 else 64)
+            return 16, 64, bk, 4, 4, True
+        return 16, 256, (128 if k % 128 == 0 else 64), 3, 4, True
+    if m <= 128 and n >= 8192:
+        bm = max(16, triton.next_power_of_2(m))
+        bk = 128 if k % 128 == 0 else 64
+        return bm, 128, bk, 3, 4, bm < 64
+    if m < 48:
+        bm = 16 if m <= 16 else 32
+        bn = 128 if n >= 2048 else 64
+        return bm, bn, (128 if k % 128 == 0 else 64), 3, 4, True
+    if n >= 512 and batch * triton.cdiv(m, 128) * triton.cdiv(n, 256) >= 128:
+        if m >= 384:
+            return 128, 256, 64, 3, 8, False
+        if m >= 96 and k % 128 == 0:
+            return 128, 128, 128, 3, 4, False
+        if m >= 64:
+            return 64, 128, 64, 4, 4, False
+    bm = 32 if m < 64 else 64
+    bk = 128 if k % 128 == 0 else 64
+    return bm, 64, bk, 4, 4, bm < 64
+
+
+def _supported(A, B, *, fused_bias=False, ignore_bias=False):
     if A.ndim != 3 or B.ndim != 3:
         raise RuntimeError("bmm expects two rank-three tensors")
     batch, m, k = A.shape
@@ -357,14 +437,23 @@ def _supported(A, B):
         return False
     if A.dtype not in (torch.float16, torch.bfloat16):
         return False
+    # The pointer kernel masks bias independently of the matrix layout.
+    if ignore_bias and n <= 16 * 65535:
+        return True
     if A.stride(2) != 1 or min(B.stride()[1:]) != 1:
         return False
     # The GEMV reduction keeps a complete row in registers. For a matrix
     # product, restrict small tiles to problems with few independent CTAs.
-    return (min(m, n) <= 4 and 256 <= k <= 16384) or (
+    if (min(m, n) <= 4 and 256 <= k <= 16384) or (
         m <= 512
         and n <= 512
         and (1024 <= k <= 8192 or (16 <= k <= 128 and min(m, n) >= 16))
+    ):
+        return True
+    if flagtune_enabled("baddbmm" if fused_bias else "bmm"):
+        return False
+    return _can_tma(A, B, batch, m, n, k) or (
+        fused_bias and B.stride(1) == 1 and n > 4 and m > 4 and n <= 16 * 65535
     )
 
 
@@ -384,7 +473,7 @@ def _batch_product(A, B, bias=None, alpha=1, beta=0):
     with torch_device_fn.device(A.device):
         if _can_tma(A, B, batch, m, n, k):
             _launch_tma(A, B, out, bias, alpha, beta, (cb, cm, cn), has_bias)
-        elif min(m, n) <= 4:
+        elif min(m, n) <= 4 and 256 <= k <= 16384:
             if m < n:
                 matrix, vector = B, A
                 rows, count = n, m
@@ -428,12 +517,14 @@ def _batch_product(A, B, bias=None, alpha=1, beta=0):
             )
         else:
             if k <= 128:
-                bm, bn, bk = 16, 32, min(64, triton.next_power_of_2(k))
+                bm, bn, bk = 16, 32, max(16, min(64, triton.next_power_of_2(k)))
             elif m % 64 == 0 and n % 64 == 0 and batch * (m // 64) * (n // 64) >= 128:
                 # A complete wave of large output tiles pays for a wider MMA.
                 bm, bn, bk = 64, 64, 64
-            else:
+            elif m <= 64 or n < 64:
                 bm, bn, bk = 16, 16 if n % 16 else 32, 128
+            else:
+                bm, bn, bk = 64, 64, 64
             _batch_mm[(triton.cdiv(m, bm), triton.cdiv(n, bn), batch)](
                 A,
                 B,
