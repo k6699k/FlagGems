@@ -30,6 +30,10 @@ from flag_gems.utils.device_info import get_device_capability, get_sm_count
 from flag_gems.utils.libentry import LibTuner
 from flag_gems.utils.triton_version_utils import HAS_TLE, HAS_TLE_DEVICE_MESH
 
+from .addmm import TensorDescriptor as _PackedTensorDescriptor
+from .addmm import _addmm_splitk, _addmm_tma
+from .bmm import _CLUSTER_MESH, _batch_tma
+
 logger = logging.getLogger(__name__)
 CACHE_USAGE_THRESHOLD = 0.8
 EXPAND_CONFIG_FILENAME = os.path.normpath(
@@ -2765,6 +2769,215 @@ def cluster_remote_mm(a, b, c, M, N, K):
     return c
 
 
+def _packed_mm(a, b, c, m, n, k):
+    # Small and medium output grids need more CTAs than the legacy GEMM tile.
+    # Keep the explicit autotuning entry points on their existing policies.
+    if (
+        (os.getenv("USE_FLAGTUNE") != "0" and runtime.flagtune_enabled("mm"))
+        or _PackedTensorDescriptor is None
+        or m < 1
+        or n < 2
+        or k < 64
+        or (4 < m <= 16 and n >= 4096)
+        or (4 < m <= 128 and n >= 32768)
+        or (m > 512 and (n <= 512 or n % 8 or k < 128))
+        or a.dtype not in (torch.float16, torch.bfloat16)
+        or a.dtype != b.dtype
+        or a.dtype != c.dtype
+        or a.device != b.device
+        or a.device != c.device
+        or not a.is_cuda
+        or not a.is_contiguous()
+        or not c.is_contiguous()
+        or c.shape != (m, n)
+        or max(m * k, n * k, m * n) >= 2**31
+    ):
+        return False
+    sb0, sb1 = b.stride()
+    nt = sb0 == 1 and sb1 == k
+    if not (nt or (sb0 == n and sb1 == 1)):
+        return False
+    tma = (
+        k % 8 == 0
+        and (nt or n % 8 == 0)
+        and a.data_ptr() % 16 == 0
+        and b.data_ptr() % 16 == 0
+    )
+    if not tma and (m > 512 or n > 512 or k < 512):
+        return False
+
+    if a.device.index != torch_device_fn.current_device():
+        with torch_device_fn.device(a.device):
+            return _packed_mm(a, b, c, m, n, k)
+
+    sm_count = get_sm_count()
+    if sm_count <= _H20_SM_COUNT:
+        return False
+    bm, bn = (16 if n < 1024 else 32), 64
+    bk = 256 if k >= 1024 else (128 if k >= 256 else 32)
+    stages, warps, trans_dot = 4, 4, True
+    thin_wide = m <= 4 and n >= 4096
+    ordinary_grid = m <= 512 and not thin_wide
+    if m > 512:
+        # Large, packed projections use wider tiles to amortize repeated A
+        # loads. Keep at least one full wave before choosing a 256-column tile.
+        trans_dot = False
+        bm, bn, bk, stages = 128, 128, 64, 3
+        if k >= 1024 and triton.cdiv(m, 128) * triton.cdiv(n, 256) >= sm_count:
+            bn, stages, warps = 256, 4, 8
+    elif thin_wide:
+        # For very thin projections, each CTA reuses the B tile across M via
+        # the transposed WGMMA. Select bandwidth-sized tiles for wide matrices.
+        bm = 16
+        if n >= 32768:
+            bn, bk = (64, 256) if nt else (128, 64)
+        elif n >= 9216:
+            bn, bk = 128, 128
+        elif k <= 256:
+            bk = 64 if k <= 128 else 128
+    tiles = triton.cdiv(m, bm) * triton.cdiv(n, bn)
+    if (
+        ordinary_grid
+        and k >= 512
+        and (tiles < sm_count // 2 or (k >= 4096 and tiles < sm_count))
+    ):
+        if tma and n >= 16 and k >= 1024 and 4 in _CLUSTER_MESH and k % 512 == 0:
+            block_k = 256 if k % 1024 == 0 else 128
+            ad, bd = _packed_mm_descriptors(a, b, m, n, k, nt, bm, bn, block_k)
+            _batch_tma[(tiles, 1, 1)](
+                ad,
+                bd,
+                c,
+                c,
+                1,
+                0,
+                0,
+                0,
+                0,
+                False,
+                False,
+                m,
+                n,
+                k,
+                1,
+                bm,
+                bn,
+                block_k,
+                4,
+                nt,
+                True,
+                _CLUSTER_MESH[4],
+                num_stages=4,
+                num_warps=4,
+            )
+            return True
+        splits = min(32, max(2, triton.next_power_of_2(triton.cdiv(256, tiles))))
+        _packed_mm_split(a, b, c, m, n, k, nt, tma, bm, bn, splits)
+        return True
+    if ordinary_grid and triton.cdiv(m, 64) * triton.cdiv(n, 64) >= sm_count // 2:
+        # Larger tiles reduce repeated B tile loads. Keep smaller tiles where
+        # increasing the tile dimensions would leave most SMs unoccupied.
+        bm, bk, trans_dot = 64, min(128, bk), False
+        if triton.cdiv(m, 64) * triton.cdiv(n, 128) >= sm_count:
+            bn, bk = 128, min(64, bk)
+            if m >= 384 and k <= 1024:
+                stages = 3
+
+    if not tma:
+        return False
+    ad, bd = _packed_mm_descriptors(a, b, m, n, k, nt, bm, bn, bk)
+    _addmm_tma[(triton.cdiv(m, bm) * triton.cdiv(n, bn),)](
+        ad,
+        bd,
+        c,
+        c,
+        1,
+        0,
+        m,
+        n,
+        k,
+        0,
+        0,
+        n,
+        1,
+        bm,
+        bn,
+        bk,
+        nt,
+        True,
+        0,
+        TRANS_DOT=trans_dot,
+        num_stages=stages,
+        num_warps=warps,
+    )
+    return True
+
+
+def _packed_mm_descriptors(a, b, m, n, k, nt, bm, bn, bk):
+    ad = _PackedTensorDescriptor(a, (m, k), (k, 1), [bm, bk])
+    if nt:
+        bd = _PackedTensorDescriptor(b, (n, k), (k, 1), [bn, bk])
+    else:
+        bd = _PackedTensorDescriptor(b, (k, n), (n, 1), [bk, bn])
+    return ad, bd
+
+
+def _packed_mm_split(a, b, c, m, n, k, nt, tma, bm, bn, splits):
+    if n <= 32:
+        # A small MMA tile avoids padding a narrow tail to a full WGMMA tile.
+        tma = False
+        bn = 16 if n <= 16 else 32
+    bk = 128 if tma else 64
+    splits = min(splits, triton.next_power_of_2(triton.cdiv(k, bk)))
+    partials = torch.empty((splits, m, n), dtype=torch.float32, device=a.device)
+    tm, tn = triton.cdiv(m, bm), triton.cdiv(n, bn)
+    if tma:
+        ad, bd = _packed_mm_descriptors(a, b, m, n, k, nt, bm, bn, bk)
+        mm_kernel_tma_transposed_splitk_partials[(tm * tn, splits)](
+            ad,
+            bd,
+            partials,
+            m,
+            n,
+            k,
+            m * n,
+            n,
+            1,
+            bm,
+            bn,
+            bk,
+            splits,
+            not nt,
+            num_stages=3,
+            num_warps=4,
+        )
+    else:
+        _addmm_splitk[(tm, tn, splits)](
+            a,
+            b,
+            partials,
+            m,
+            n,
+            k,
+            *b.stride(),
+            splits,
+            bm,
+            bn,
+            bk,
+            num_stages=3,
+            num_warps=4,
+        )
+    mm_kernel_tma_splitk_reduce[(triton.cdiv(m * n, 256),)](
+        partials,
+        c,
+        m * n,
+        m * n,
+        splits,
+        256,
+        num_warps=4,
+    )
+
+
 def mm(a, b):
     device = a.device
     # handle non-contiguous inputs if necessary
@@ -2785,6 +2998,8 @@ def mm(a, b):
     # Optimize for N=1 case (matrix-vector multiplication)
     if N == 1:
         return gemv_mm(a, b, c, M, K)
+    if _packed_mm(a, b, c, M, N, K):
+        return c
     if _splitk_gemv_scenario(a, b, c, M, N, K) or _batched_splitk_gemv_scenario(
         a, b, c, M, N, K
     ):
@@ -2838,6 +3053,8 @@ def mm_out(a, b, *, out):
     # Optimize for N=1 case (matrix-vector multiplication)
     if N == 1:
         return gemv_mm(a, b, out, M, K)
+    if _packed_mm(a, b, out, M, N, K):
+        return out
     if _splitk_gemv_scenario(a, b, out, M, N, K) or _batched_splitk_gemv_scenario(
         a, b, out, M, N, K
     ):
