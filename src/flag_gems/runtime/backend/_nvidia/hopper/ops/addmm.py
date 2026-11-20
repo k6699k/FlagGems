@@ -237,6 +237,20 @@ def _addmm_tma(
     )
 
 
+def _tma_config(m, n, k, device, trans_b):
+    if n <= 64 or (m <= 512 and n <= 512):
+        return 64, 64, 128, 4, 4
+    if m >= 1024:
+        return 128, 256, 64, 3, 8
+    if 64 < m <= 128 and not trans_b and k >= 4096:
+        # One M tile, so doubling the N tile can fit the whole grid in one
+        # wave. Avoid a partly occupied second wave of long-lived CTAs.
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        if sm_count < triton.cdiv(n, 128) <= 2 * sm_count:
+            return 128, 256, 64, 3, 8
+    return 128, 128, 64, 4, 4
+
+
 def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
     if mat2.device != mat1.device or bias.device != mat1.device:
         raise RuntimeError("addmm expects all operands to be on the same device")
@@ -344,12 +358,7 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
                 beta_kind,
             )
         else:
-            if n <= 64 or (m <= 512 and n <= 512):
-                bm, bn, bk, stages, warps = 64, 64, 128, 4, 4
-            elif m >= 1024:
-                bm, bn, bk, stages, warps = 128, 256, 64, 3, 8
-            else:
-                bm, bn, bk, stages, warps = 128, 128, 64, 4, 4
+            bm, bn, bk, stages, warps = _tma_config(m, n, k, mat1.device, trans_b)
             a = TensorDescriptor.from_tensor(mat1, [bm, bk])
             b = TensorDescriptor.from_tensor(
                 mat2.t() if trans_b else mat2, [bn, bk] if trans_b else [bk, bn]
