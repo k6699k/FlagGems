@@ -287,6 +287,9 @@ def _launch_tma(A, B, out, bias, alpha, beta, bias_strides, has_bias):
         blocks = k // bk
         splits = min(2 if batch >= 8 and not nt else 4, blocks & -blocks)
         stages = 3
+        if nt and batch >= 4 and k % 512 == 0:
+            # Two deeper K partitions keep transposed loads contiguous.
+            bm, bk, splits, stages = 32, 256, 2, 4
     else:
         # As the batch grows the same tile grid spans more Hopper SMs.
         # Widen tiles once there is enough parallel work to cover the device.
