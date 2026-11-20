@@ -38,6 +38,32 @@ def _combine(acc, bias, alpha, beta, ALPHA_ONE: tl.constexpr, BETA: tl.constexpr
 
 
 @triton.jit
+def _scale_bias(
+    Bias,
+    Out,
+    beta,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    SI0: tl.constexpr,
+    SI1: tl.constexpr,
+    READ_BIAS: tl.constexpr,
+    IS_DOUBLE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    idx = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    valid = idx < M * N
+    if READ_BIAS:
+        v = tl.load(Bias + (idx // N) * SI0 + (idx % N) * SI1, valid, 0)
+        if IS_DOUBLE:
+            result = v.to(tl.float64) * beta
+        else:
+            result = v.to(tl.float32) * beta
+    else:
+        result = 0.0
+    tl.store(Out + idx, result, valid)
+
+
+@triton.jit
 def _addmm_vector(
     A,
     B,
@@ -70,25 +96,32 @@ def _addmm_vector(
     else:
         rows, cols = pos, single
     kk = tl.arange(0, BK)
-    products = tl.full((TILE, BK), 0, tl.float32)
-    for i in range(tl.cdiv(K, BK)):
-        k = i * BK + kk
-        if ROW_VECTOR:
-            vec = tl.load(A + rows * SA0 + k * SA1, k < K, 0).to(tl.float32)
-            mat = tl.load(
-                B + k[None, :] * SB0 + cols[:, None] * SB1,
-                (cols[:, None] < N) & (k[None, :] < K),
-                0,
-            )
-        else:
-            vec = tl.load(B + k * SB0 + cols * SB1, k < K, 0).to(tl.float32)
-            mat = tl.load(
-                A + rows[:, None] * SA0 + k[None, :] * SA1,
-                (rows[:, None] < M) & (k[None, :] < K),
-                0,
-            )
-        products = tl.fma(vec[None, :], mat.to(tl.float32), products)
-    acc = tl.sum(products, axis=1)
+    # Reduce coalesced row-major B loads along K, keeping adjacent output
+    # columns next to one another in memory.
+    if ROW_VECTOR and SB1 == 1 and K == BK:
+        vec = tl.load(A + rows * SA0 + kk * SA1).to(tl.float32)
+        mat = tl.load(B + kk[:, None] * SB0 + cols[None, :], cols[None, :] < N, 0)
+        acc = tl.sum(mat.to(tl.float32) * vec[:, None], axis=0)
+    else:
+        products = tl.full((TILE, BK), 0, tl.float32)
+        for i in range(tl.cdiv(K, BK)):
+            k = i * BK + kk
+            if ROW_VECTOR:
+                vec = tl.load(A + rows * SA0 + k * SA1, k < K, 0).to(tl.float32)
+                mat = tl.load(
+                    B + k[None, :] * SB0 + cols[:, None] * SB1,
+                    (cols[:, None] < N) & (k[None, :] < K),
+                    0,
+                )
+            else:
+                vec = tl.load(B + k * SB0 + cols * SB1, k < K, 0).to(tl.float32)
+                mat = tl.load(
+                    A + rows[:, None] * SA0 + k[None, :] * SA1,
+                    (rows[:, None] < M) & (k[None, :] < K),
+                    0,
+                )
+            products = tl.fma(vec[None, :], mat.to(tl.float32), products)
+        acc = tl.sum(products, axis=1)
     valid = (rows < M) & (cols < N)
     rows = rows.to(tl.int64)
     cols = cols.to(tl.int64)
@@ -202,6 +235,7 @@ def _addmm_tma(
     TRANS_B: tl.constexpr,
     ALPHA_ONE: tl.constexpr,
     BETA: tl.constexpr,
+    TRANS_DOT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     # Group adjacent row tiles to reuse the same B tile from L2.
@@ -213,14 +247,22 @@ def _addmm_tma(
     in_group = pid % (8 * num_n)
     m = (first_m + in_group % group_m) * BM
     n = (in_group // group_m) * BN
-    acc = tl.full((BM, BN), 0, tl.float32)
+    if TRANS_DOT:
+        acc = tl.full((BN, BM), 0, tl.float32)
+    else:
+        acc = tl.full((BM, BN), 0, tl.float32)
     for i in range(tl.cdiv(K, BK)):
         a = A.load([m, i * BK])
         if TRANS_B:
             b = tl.trans(B.load([n, i * BK]))
         else:
             b = B.load([i * BK, n])
-        acc = tl.dot(a, b, acc)
+        if TRANS_DOT:
+            acc = tl.dot(tl.trans(b), tl.trans(a), acc)
+        else:
+            acc = tl.dot(a, b, acc)
+    if TRANS_DOT:
+        acc = tl.trans(acc)
     rows = (m + tl.arange(0, BM)).to(tl.int64)
     cols = (n + tl.arange(0, BN)).to(tl.int64)
     valid = (rows[:, None] < M) & (cols[None, :] < N)
@@ -237,25 +279,60 @@ def _addmm_tma(
     )
 
 
-def _tma_config(m, n, k, device, trans_b):
+def _tma_config(m, n, k, device):
+    # For short/wide outputs, swap the dot operands so the hardware's 64-row
+    # WGMMA tile runs along N. More, narrower M tiles expose more parallelism.
+    if 16 <= m <= 512 and n >= 128 and k >= 512 and m * n <= 1048576:
+        bm = 16 if n <= 512 and k >= 2048 else 32
+        bk = 128 if n > 512 and k <= 1024 else 256
+        stages = 4 if k >= 2048 else 3
+        return bm, 64, bk, stages, 4, True
     if n <= 64 or (m <= 512 and n <= 512):
-        return 64, 64, 128, 4, 4
+        return 64, 64, 128, 4, 4, False
     if m >= 1024:
-        return 128, 256, 64, 3, 8
-    if 64 < m <= 128 and not trans_b and k >= 4096:
+        return 128, 256, 64, 3, 8, False
+    if 64 < m <= 128 and k >= 4096:
         # One M tile, so doubling the N tile can fit the whole grid in one
         # wave. Avoid a partly occupied second wave of long-lived CTAs.
         sm_count = torch.cuda.get_device_properties(device).multi_processor_count
         if sm_count < triton.cdiv(n, 128) <= 2 * sm_count:
-            return 128, 256, 64, 3, 8
-    return 128, 128, 64, 4, 4
+            return 128, 256, 64, 3, 8, False
+    return 128, 128, 64, 4, 4, False
 
 
 def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
     if mat2.device != mat1.device or bias.device != mat1.device:
         raise RuntimeError("addmm expects all operands to be on the same device")
+    device = mat1.device
+    if device.type != "cuda":
+        return _addmm_impl(bias, mat1, mat2, None, beta, alpha)
+    if device.index != torch_device_fn.current_device():
+        with torch_device_fn.device(device):
+            return addmm(bias, mat1, mat2, beta=beta, alpha=alpha)
     m, k = mat1.shape
     kb, n = mat2.shape
+    matrix_bias = bias.shape == (m, n)
+    if (
+        alpha == 0
+        and kb == k
+        and mat1.dtype == mat2.dtype == bias.dtype
+        and mat1.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+        and (matrix_bias or broadcastable_to(bias.shape, (m, n)))
+    ):
+        out = torch.empty((m, n), device=device, dtype=mat1.dtype)
+        if m and n:
+            _scale_bias[(triton.cdiv(m * n, 256),)](
+                bias,
+                out,
+                beta,
+                m,
+                n,
+                *bias.expand(m, n).stride(),
+                beta != 0,
+                mat1.dtype == torch.float64,
+                256,
+            )
+        return out
     row_vec = m <= 2
     vector = row_vec or n == 1
     # Split long reductions whose output tiles alone underfill the GPU.
@@ -265,24 +342,29 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
     split_k = m <= 256 and (small_output or long_reduction) and not vector
     tma = (
         hasattr(TensorDescriptor, "from_tensor")
-        and m >= 64
+        and m >= 16
         and n >= 64
         and k >= 64
-        and triton.cdiv(m, 64) * triton.cdiv(n, 128) >= 32
+        and triton.cdiv(m, 16) * triton.cdiv(n, 64) >= 32
     )
+    if tma and not small_output and m * n >= 65536:
+        split_k = False
     if not (vector or split_k or tma):
         return _addmm_impl(bias, mat1, mat2, None, beta, alpha)
-    trans_b = mat2.stride(1) != 1
+    sb0, sb1 = mat2.stride()
+    trans_b = sb1 != 1
     if (
         min(m, n, k) == 0
         or k != kb
         or mat1.dtype not in (torch.float16, torch.bfloat16)
         or mat2.dtype != mat1.dtype
         or bias.dtype != mat1.dtype
-        or not broadcastable_to(bias.shape, (m, n))
+        or (not matrix_bias and not broadcastable_to(bias.shape, (m, n)))
         or max(m * k, k * n, m * n) >= 2**31
         or not mat1.is_contiguous()
-        or not (mat2.t() if trans_b else mat2).is_contiguous()
+        or not (
+            (sb1 == 1 and (sb0 == n or k == 1)) or (sb0 == 1 and (sb1 == k or n == 1))
+        )
         or (
             tma
             and not (vector or split_k)
@@ -296,92 +378,111 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
     ):
         return _addmm_impl(bias, mat1, mat2, None, beta, alpha)
     out = torch.empty((m, n), device=mat1.device, dtype=mat1.dtype)
-    si = bias.expand(m, n).stride()
+    # Views dispatched through ATen add host cost at decode sizes. Derive
+    # broadcast strides directly, including zero-stride expanded inputs.
+    si = (
+        bias.stride()
+        if matrix_bias
+        else (
+            bias.stride(0) if bias.ndim == 2 and bias.shape[0] != 1 else 0,
+            bias.stride(-1) if bias.ndim and bias.shape[-1] != 1 else 0,
+        )
+    )
     beta_kind = 0 if beta == 0 else 1 if beta == 1 else 2
-    with torch_device_fn.device(mat1.device):
-        if vector:
-            tile = 4 if row_vec else 8
-            bk = min(triton.next_power_of_2(k), 512)
-            grid = (triton.cdiv(n, tile), m) if row_vec else (triton.cdiv(m, tile), n)
-            _addmm_vector[grid](
-                mat1,
-                mat2,
-                bias,
-                out,
-                alpha,
-                beta,
-                m,
-                n,
-                k,
-                *mat1.stride(),
-                *mat2.stride(),
-                *si,
-                *out.stride(),
-                tile,
-                bk,
-                row_vec,
-                alpha == 1,
-                beta_kind,
-                num_warps=4,
-            )
-        elif split_k:
-            splits = 16 if small_output else 4
-            bm, bn, bk = 16, 32, 64
-            partials = torch.empty(
-                (splits, m, n), device=mat1.device, dtype=torch.float32
-            )
-            _addmm_splitk[(triton.cdiv(m, bm), triton.cdiv(n, bn), splits)](
-                mat1,
-                mat2,
-                partials,
-                m,
-                n,
-                k,
-                *mat2.stride(),
-                splits,
-                bm,
-                bn,
-                bk,
-            )
-            _addmm_finish[(triton.cdiv(m * n, 128),)](
-                partials,
-                bias,
-                out,
-                alpha,
-                beta,
-                m,
-                n,
-                *si,
-                splits,
-                128,
-                alpha == 1,
-                beta_kind,
-            )
+    if vector:
+        # Warp-parallel reduction of a full K row is inexpensive for
+        # decode; the 1024-thread CTA shortens very long reductions.
+        if k <= 16384 and k & (k - 1) == 0:
+            tile = 4 if row_vec and not trans_b and n % 4 == 0 and n >= 32 else 1
+            if row_vec and trans_b and k <= 256 and n >= 512:
+                # Reuse a short input row across contiguous rows of the weight.
+                tile = 32
+            bk = k
+            warps = 32 if k >= 8192 else (8 if row_vec else 4)
         else:
-            bm, bn, bk, stages, warps = _tma_config(m, n, k, mat1.device, trans_b)
-            a = TensorDescriptor.from_tensor(mat1, [bm, bk])
-            b = TensorDescriptor.from_tensor(
-                mat2.t() if trans_b else mat2, [bn, bk] if trans_b else [bk, bn]
-            )
-            _addmm_tma[(triton.cdiv(m, bm) * triton.cdiv(n, bn),)](
-                a,
-                b,
-                bias,
-                out,
-                alpha,
-                beta,
-                m,
-                n,
-                k,
-                *si,
-                *out.stride(),
-                bm,
-                bn,
-                bk,
-                trans_b,
-                alpha == 1,
-                beta_kind,
-                num_stages=stages,
-                num_warps=warps,
-            )
+            tile, bk, warps = 4, min(triton.next_power_of_2(k), 512), 4
+        grid = (triton.cdiv(n, tile), m) if row_vec else (triton.cdiv(m, tile), n)
+        _addmm_vector[grid](
+            mat1,
+            mat2,
+            bias,
+            out,
+            alpha,
+            beta,
+            m,
+            n,
+            k,
+            *mat1.stride(),
+            *mat2.stride(),
+            *si,
+            *out.stride(),
+            tile,
+            bk,
+            row_vec,
+            alpha == 1,
+            beta_kind,
+            num_warps=warps,
+        )
+    elif split_k:
+        splits = 16 if small_output else 4
+        bm, bn, bk = 16, 32, 64
+        partials = torch.empty((splits, m, n), device=mat1.device, dtype=torch.float32)
+        _addmm_splitk[(triton.cdiv(m, bm), triton.cdiv(n, bn), splits)](
+            mat1,
+            mat2,
+            partials,
+            m,
+            n,
+            k,
+            *mat2.stride(),
+            splits,
+            bm,
+            bn,
+            bk,
+        )
+        _addmm_finish[(triton.cdiv(m * n, 128),)](
+            partials,
+            bias,
+            out,
+            alpha,
+            beta,
+            m,
+            n,
+            *si,
+            splits,
+            128,
+            alpha == 1,
+            beta_kind,
+        )
+    else:
+        bm, bn, bk, stages, warps, trans_dot = _tma_config(m, n, k, mat1.device)
+        a = TensorDescriptor.from_tensor(mat1, [bm, bk])
+        b = TensorDescriptor(
+            mat2,
+            (n, k) if trans_b else (k, n),
+            (sb1, sb0) if trans_b else (sb0, sb1),
+            [bn, bk] if trans_b else [bk, bn],
+        )
+        _addmm_tma[(triton.cdiv(m, bm) * triton.cdiv(n, bn),)](
+            a,
+            b,
+            bias,
+            out,
+            alpha,
+            beta,
+            m,
+            n,
+            k,
+            *si,
+            *out.stride(),
+            bm,
+            bn,
+            bk,
+            trans_b,
+            alpha == 1,
+            beta_kind,
+            TRANS_DOT=trans_dot,
+            num_stages=stages,
+            num_warps=warps,
+        )
     return out

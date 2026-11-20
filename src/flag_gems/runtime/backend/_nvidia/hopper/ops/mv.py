@@ -68,52 +68,82 @@ def _finish_mv(
 
 def mv(inp, vec):
     if inp.ndim != 2 or vec.ndim != 1:
-        return generic_mv(inp, vec)
+        raise RuntimeError("mv expects a matrix and a vector")
     rows, k = inp.shape
+    if k != vec.numel() or inp.dtype != vec.dtype or inp.device != vec.device:
+        raise RuntimeError("mv needs matching K dimensions, dtypes and devices")
     if (
-        inp.dtype not in (torch.float16, torch.bfloat16)
-        or inp.dtype != vec.dtype
-        or inp.device != vec.device
+        inp.device.type != "cuda"
+        or inp.dtype not in (torch.float16, torch.bfloat16)
         or not vec.is_contiguous()
-        or k != vec.numel()
         or not (1024 <= k <= 8192 and 0 < rows and rows * k < 2**31)
     ):
         return generic_mv(inp, vec)
 
     row_major = inp.is_contiguous()
-    if not row_major and (not inp.t().is_contiguous() or (rows < 256 and k < 3072)):
+    if not row_major and (inp.stride() != (1, rows) or (rows < 256 and k < 3072)):
         return generic_mv(inp, vec)
 
+    if inp.device.index != torch_device_fn.current_device():
+        with torch_device_fn.device(inp.device):
+            return mv(inp, vec)
     out = torch.empty(rows, device=inp.device, dtype=inp.dtype)
-    with torch_device_fn.device(inp.device):
-        if row_major:
-            # A CTA can reduce one contiguous row without exchanging partials.
-            _row_mv[(rows,)](inp, vec, out, k, triton.next_power_of_2(k), num_warps=8)
+    if row_major:
+        # A CTA can reduce one contiguous row without exchanging partials.
+        _row_mv[(rows,)](inp, vec, out, k, triton.next_power_of_2(k), num_warps=8)
+    elif (
+        rows >= 256
+        and rows % 64 == 0
+        and k % 256 == 0
+        and (rows < 2048 or k <= 2 * rows)
+    ):
+        # Reading several adjacent rows together coalesces the column-major
+        # loads. Reduce all of K in this CTA and write directly to out.
+        if rows >= 16384:
+            tile_rows, tile_k, warps = 64, 256, 4
+        elif rows >= 8192:
+            tile_rows, tile_k, warps = 64, 512, 8
+        elif rows >= 2048:
+            tile_rows = 16 if rows == 2048 and k <= 2048 else 32
+            tile_k, warps = (1024 if k >= 4096 else 512), 8
         else:
-            # Load neighboring output rows together. Splitting K provides enough
-            # CTAs even for a narrow matrix and reduces long-stride HBM reads.
-            tile_rows = 16 if rows < 256 else 64
-            chunk = 128 if rows < 4096 else 512
-            splits = triton.cdiv(k, chunk)
-            partials = torch.empty(
-                (splits, rows), device=inp.device, dtype=torch.float32
-            )
-            _column_mv[(triton.cdiv(rows, tile_rows), splits)](
-                inp,
-                vec,
-                partials,
-                rows,
-                k,
-                tile_rows,
-                64,
-                chunk,
-            )
-            _finish_mv[(triton.cdiv(rows, 32),)](
-                partials,
-                out,
-                rows,
-                splits,
-                32,
-                triton.next_power_of_2(splits),
-            )
+            tile_rows, tile_k, warps = 8, min(2048, triton.next_power_of_2(k)), 8
+        _column_mv[(rows // tile_rows, 1)](
+            inp,
+            vec,
+            out,
+            rows,
+            k,
+            tile_rows,
+            tile_k,
+            k,
+            num_warps=warps,
+        )
+    else:
+        # Load neighboring output rows together. Splitting K provides enough
+        # CTAs even for a narrow matrix and reduces long-stride HBM reads.
+        tile_rows = 16 if rows < 256 else 64
+        chunk = 128 if rows < 4096 else 512
+        splits = triton.cdiv(k, chunk)
+        partials = torch.empty(
+            (splits, rows), device=inp.device, dtype=torch.float32
+        )
+        _column_mv[(triton.cdiv(rows, tile_rows), splits)](
+            inp,
+            vec,
+            partials,
+            rows,
+            k,
+            tile_rows,
+            64,
+            chunk,
+        )
+        _finish_mv[(triton.cdiv(rows, 32),)](
+            partials,
+            out,
+            rows,
+            splits,
+            32,
+            triton.next_power_of_2(splits),
+        )
     return out
