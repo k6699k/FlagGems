@@ -18,6 +18,29 @@ import triton.language as tl
 
 from flag_gems.ops.bmm import bmm as generic_bmm
 from flag_gems.runtime import torch_device_fn
+from flag_gems.utils.triton_version_utils import HAS_TLE_DEVICE_MESH
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except ImportError:
+    TensorDescriptor = None
+
+
+tle = None
+_CLUSTER_MESH = {}
+if HAS_TLE_DEVICE_MESH:
+    try:
+        import triton.experimental.tle.language as tle
+
+        if all(
+            hasattr(tle, name) for name in ("remote", "distributed_barrier", "shard_id")
+        ) and all(hasattr(tle.gpu, name) for name in ("smem", "alloc", "local_ptr")):
+            _CLUSTER_MESH = {
+                size: tle.device_mesh({"block_cluster": [("cluster_x", size)]})
+                for size in (2, 4)
+            }
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
 
 
 @triton.jit
@@ -150,16 +173,188 @@ def _batch_mm(
     )
 
 
+@triton.jit
+def _batch_tma(
+    ad,
+    bd,
+    out,
+    bias,
+    alpha,
+    beta,
+    CB: tl.constexpr,
+    CM: tl.constexpr,
+    CN: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    READ_BIAS: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    B: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    SPLIT: tl.constexpr,
+    NT: tl.constexpr,
+    TRAN: tl.constexpr,
+    MESH: tl.constexpr,
+):
+    tile = tl.program_id(0) // SPLIT
+    if SPLIT > 1 and not NT and B >= 4:
+        # Adjacent clusters cover the same output tile in different batches.
+        z = tile % B
+        tile = tile // B
+    else:
+        z = tl.program_id(2)
+    if SPLIT > 1:
+        s = tle.shard_id(MESH, "cluster_x")
+    else:
+        s = 0
+    m = tile // (N // BN) * BM
+    n = tile % (N // BN) * BN
+    if TRAN:
+        acc = tl.full((BN, BM), 0, tl.float32)
+    else:
+        acc = tl.full((BM, BN), 0, tl.float32)
+    for i in range(K // BK // SPLIT):
+        if SPLIT > 1 and not NT and B >= 4:
+            k = (i * SPLIT + s) * BK
+        else:
+            k = (s * (K // BK // SPLIT) + i) * BK
+        a = ad.load([z * M + m, k])
+        if NT:
+            bt = bd.load([z * N + n, k])
+        else:
+            bt = tl.trans(bd.load([z * K + k, n]))
+        if TRAN:
+            acc = tl.dot(bt, tl.trans(a), acc)
+        else:
+            acc = tl.dot(a, tl.trans(bt), acc)
+    if TRAN:
+        v = tl.trans(acc)
+    else:
+        v = acc
+    rm = tl.broadcast_to(tl.arange(0, BM)[:, None], (BM, BN))
+    rn = tl.broadcast_to(tl.arange(0, BN)[None, :], (BM, BN))
+    if SPLIT > 1:
+        workspace = tle.gpu.alloc([BM, BN], tl.float32, layout=None, scope=tle.gpu.smem)
+        tl.store(tle.gpu.local_ptr(workspace, (rm, rn)), v)
+        tle.distributed_barrier(MESH)
+    if s == 0:
+        if SPLIT > 1:
+            for peer_id in tl.static_range(1, SPLIT):
+                peer = tle.remote(workspace, peer_id, scope=MESH)
+                v += tl.load(tle.gpu.local_ptr(peer, (rm, rn)))
+        rows, cols = m + rm, n + rn
+        offsets = z * M * N + rows * N + cols
+        bias_offsets = (
+            z.to(tl.int64) * CB + rows.to(tl.int64) * CM + cols.to(tl.int64) * CN
+        )
+        _store_result(
+            v, bias, out, offsets, True, bias_offsets, alpha, beta, HAS_BIAS, READ_BIAS
+        )
+    if SPLIT > 1:
+        # Keep all peer CTAs resident until rank zero has read their partials.
+        tle.distributed_barrier(MESH)
+
+
+def _can_tma(A, B, batch, m, n, k):
+    # Fold packed batches into the row dimension of a 2-D tensor map.
+    # Descriptor coordinates and workspace offsets use signed 32-bit indices.
+    return (
+        TensorDescriptor is not None
+        and 1 <= batch <= 16
+        and (m >= 64 or bool(_CLUSTER_MESH))
+        and 32 <= m <= 512
+        and m % 32 == 0
+        and 128 <= n <= 512
+        and n % 64 == 0
+        and 1024 <= k <= 8192
+        and k % 128 == 0
+        and A.stride() == (m * k, k, 1)
+        and B.stride() in ((k * n, n, 1), (k * n, 1, k))
+        and A.data_ptr() % 16 == 0
+        and B.data_ptr() % 16 == 0
+    )
+
+
+def _launch_tma(A, B, out, bias, alpha, beta, bias_strides, has_bias):
+    batch, m, k = A.shape
+    n = B.size(2)
+    nt = B.stride(1) == 1
+    if m < 64:
+        bm, bn, bk = (16 if batch <= 2 or (batch <= 4 and nt) else 32), 64, 128
+        trans_dot = True
+        blocks = k // bk
+        splits = min(2 if batch >= 8 and not nt else 4, blocks & -blocks)
+        stages = 3
+    else:
+        # As the batch grows the same tile grid spans more Hopper SMs.
+        # Widen tiles once there is enough parallel work to cover the device.
+        tile_count = batch * (m // 64) * (n // 64)
+        if m % 64 == 0 and tile_count >= 256 and n % 128 == 0:
+            bm, bn, bk, stages, trans_dot = 64, 128, 128, 4, nt
+        elif m % 64 == 0 and tile_count >= 128:
+            bm, bn, bk, stages, trans_dot = 64, 64, 128, 5, nt
+        else:
+            bm, bn = (64, 32) if m % 64 == 0 else (32, 64)
+            bk = 256 if k % 256 == 0 else 128
+            stages, trans_dot = 4, bm < 64
+        splits = 1
+    ad = TensorDescriptor(A, [batch * m, k], [k, 1], [bm, bk])
+    width = k if nt else n
+    height = n if nt else k
+    bd = TensorDescriptor(
+        B, [batch * height, width], [width, 1], [bn, bk] if nt else [bk, bn]
+    )
+    read_bias = has_bias and beta != 0
+    tiles = (m // bm) * (n // bn)
+    grid = (
+        (tiles * batch, 1, 1)
+        if splits > 1 and not nt and batch >= 4
+        else (tiles, 1, batch)
+    )
+    _batch_tma[grid](
+        ad,
+        bd,
+        out,
+        bias,
+        alpha,
+        beta,
+        *bias_strides,
+        has_bias,
+        read_bias,
+        m,
+        n,
+        k,
+        batch,
+        bm,
+        bn,
+        bk,
+        splits,
+        nt,
+        trans_dot,
+        _CLUSTER_MESH.get(splits),
+        num_stages=stages,
+        num_warps=4,
+    )
+
+
 def _supported(A, B):
     if A.ndim != 3 or B.ndim != 3:
-        return False
+        raise RuntimeError("bmm expects two rank-three tensors")
     batch, m, k = A.shape
     b, other_k, n = B.shape
-    if not (0 < batch == b <= 65535 and 0 < k == other_k and min(m, n) > 0):
+    if batch != b or k != other_k:
+        raise RuntimeError("bmm expects matching batch and contracting dimensions")
+    if A.dtype != B.dtype or A.device != B.device:
+        raise RuntimeError(
+            "bmm expects both inputs on the same device with the same dtype"
+        )
+    if batch == 0 or batch > 65535 or min(m, n, k) == 0:
         return False
-    if A.dtype not in (torch.float16, torch.bfloat16) or A.dtype != B.dtype:
+    if A.dtype not in (torch.float16, torch.bfloat16):
         return False
-    if A.device != B.device or A.stride(2) != 1 or min(B.stride()[1:]) != 1:
+    if A.stride(2) != 1 or min(B.stride()[1:]) != 1:
         return False
     # The GEMV reduction keeps a complete row in registers. For a matrix
     # product, restrict small tiles to problems with few independent CTAs.
@@ -176,12 +371,17 @@ def _batch_product(A, B, bias=None, alpha=1, beta=0):
     out = torch.empty((batch, m, n), device=A.device, dtype=A.dtype)
     has_bias = bias is not None
     if has_bias:
-        cb, cm, cn = bias.expand(batch, m, n).stride()
+        if bias.shape == (batch, m, n):
+            cb, cm, cn = bias.stride()
+        else:
+            cb, cm, cn = bias.expand(batch, m, n).stride()
     else:
         cb = cm = cn = 0
         bias = out
     with torch_device_fn.device(A.device):
-        if min(m, n) <= 4:
+        if _can_tma(A, B, batch, m, n, k):
+            _launch_tma(A, B, out, bias, alpha, beta, (cb, cm, cn), has_bias)
+        elif min(m, n) <= 4:
             if m < n:
                 matrix, vector = B, A
                 rows, count = n, m
@@ -192,7 +392,11 @@ def _batch_product(A, B, bias=None, alpha=1, beta=0):
                 rows, count = m, n
                 xm, xk, vr, vk = A.stride(1), A.stride(2), B.stride(2), B.stride(1)
                 ym, yv = n, 1
-            rows_per_cta = 4 if rows >= 512 else 1
+            if m < n and xm == 1 and n >= 32 and 1024 <= k <= 4096:
+                # Adjacent outputs share a cache line of row-major B.
+                rows_per_cta = 8 if batch >= 8 else 4
+            else:
+                rows_per_cta = 4 if rows >= 512 else 1
             _batch_gemv[(triton.cdiv(rows, rows_per_cta), count, batch)](
                 matrix,
                 vector,

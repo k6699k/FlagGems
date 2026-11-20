@@ -125,9 +125,7 @@ def mv(inp, vec):
         tile_rows = 16 if rows < 256 else 64
         chunk = 128 if rows < 4096 else 512
         splits = triton.cdiv(k, chunk)
-        partials = torch.empty(
-            (splits, rows), device=inp.device, dtype=torch.float32
-        )
+        partials = torch.empty((splits, rows), device=inp.device, dtype=torch.float32)
         _column_mv[(triton.cdiv(rows, tile_rows), splits)](
             inp,
             vec,

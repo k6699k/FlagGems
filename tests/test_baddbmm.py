@@ -62,6 +62,23 @@ def test_baddbmm(batch, M, N, K, scalar, dtype, b_column_major):
     gems_assert_close(res_out, ref_out, dtype, reduce_dim=K)
 
 
+@pytest.mark.baddbmm
+@pytest.mark.skipif(
+    not flag_gems.baddbmm.__module__.endswith("hopper.ops.baddbmm"),
+    reason="exercises the Hopper baddbmm epilogue",
+)
+@pytest.mark.parametrize("beta", [0, 1, -0.5])
+def test_hopper_baddbmm_zero_alpha(beta):
+    options = {"device": flag_gems.device, "dtype": torch.bfloat16}
+    a = torch.full((2, 32, 1024), float("nan"), **options)
+    b = torch.ones((2, 1024, 128), **options)
+    bias = torch.full((1, 32, 1), float("nan") if beta == 0 else 3.0, **options)
+    expected = torch.baddbmm(bias, a, b, alpha=0, beta=beta)
+    with flag_gems.use_gems(include=["baddbmm"]):
+        result = torch.baddbmm(bias, a, b, alpha=0, beta=beta)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0, equal_nan=True)
+
+
 @pytest.mark.baddbmm_out
 @pytest.mark.parametrize("M, N, K", MNK_SHAPES)
 @pytest.mark.parametrize("scalar", SCALARS)

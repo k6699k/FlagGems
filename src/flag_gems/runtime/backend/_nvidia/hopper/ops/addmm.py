@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 
 from flag_gems.ops.addmm import _addmm_impl
+from flag_gems.ops.copy import copy_
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import broadcastable_to
 
@@ -35,32 +36,6 @@ def _combine(acc, bias, alpha, beta, ALPHA_ONE: tl.constexpr, BETA: tl.constexpr
     elif BETA != 0:
         acc = acc + beta * bias
     return acc
-
-
-@triton.jit
-def _scale_bias(
-    Bias,
-    Out,
-    beta,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    SI0: tl.constexpr,
-    SI1: tl.constexpr,
-    READ_BIAS: tl.constexpr,
-    IS_DOUBLE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    idx = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    valid = idx < M * N
-    if READ_BIAS:
-        v = tl.load(Bias + (idx // N) * SI0 + (idx % N) * SI1, valid, 0)
-        if IS_DOUBLE:
-            result = v.to(tl.float64) * beta
-        else:
-            result = v.to(tl.float32) * beta
-    else:
-        result = 0.0
-    tl.store(Out + idx, result, valid)
 
 
 @triton.jit
@@ -314,25 +289,15 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
     matrix_bias = bias.shape == (m, n)
     if (
         alpha == 0
+        and beta in (0, 1)
         and kb == k
         and mat1.dtype == mat2.dtype == bias.dtype
         and mat1.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
         and (matrix_bias or broadcastable_to(bias.shape, (m, n)))
     ):
-        out = torch.empty((m, n), device=device, dtype=mat1.dtype)
-        if m and n:
-            _scale_bias[(triton.cdiv(m * n, 256),)](
-                bias,
-                out,
-                beta,
-                m,
-                n,
-                *bias.expand(m, n).stride(),
-                beta != 0,
-                mat1.dtype == torch.float64,
-                256,
-            )
-        return out
+        if beta == 0:
+            return torch.zeros((m, n), device=device, dtype=mat1.dtype)
+        return copy_(torch.empty((m, n), device=device, dtype=mat1.dtype), bias)
     row_vec = m <= 2
     vector = row_vec or n == 1
     # Split long reductions whose output tiles alone underfill the GPU.

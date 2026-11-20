@@ -104,7 +104,7 @@ def test_addmm(M, N, K, scalar, dtype, b_column_major):
     not flag_gems.addmm.__module__.endswith("hopper.ops.addmm"),
     reason="exercises the Hopper addmm epilogue",
 )
-@pytest.mark.parametrize("beta", [0, -0.5])
+@pytest.mark.parametrize("beta", [0, 1, -0.5])
 def test_hopper_addmm_zero_alpha(beta):
     options = {"device": flag_gems.device, "dtype": torch.float16}
     a = torch.full((32, 1024), float("nan"), **options)
@@ -113,7 +113,7 @@ def test_hopper_addmm_zero_alpha(beta):
     expected = torch.addmm(bias, a, b, alpha=0, beta=beta)
     with flag_gems.use_gems(include=["addmm"]):
         result = torch.addmm(bias, a, b, alpha=0, beta=beta)
-    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0, equal_nan=True)
 
 
 @pytest.mark.addmm
