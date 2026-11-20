@@ -2772,15 +2772,23 @@ def cluster_remote_mm(a, b, c, M, N, K):
 def _packed_mm(a, b, c, m, n, k):
     # Small and medium output grids need more CTAs than the legacy GEMM tile.
     # Keep the explicit autotuning entry points on their existing policies.
+    thin_wide = n >= 4096 and (m <= 4 or (m <= 16 and k <= 1024 and n < 32768))
+    tall_narrow = (
+        1024 <= m <= 8192
+        and 32 <= n <= 512
+        and (n <= 256 or m < 2048)
+        and k >= 1024
+        and k % 256 == 0
+    )
     if (
         (os.getenv("USE_FLAGTUNE") != "0" and runtime.flagtune_enabled("mm"))
         or _PackedTensorDescriptor is None
         or m < 1
         or n < 2
         or k < 64
-        or (4 < m <= 16 and n >= 4096)
+        or (4 < m <= 16 and n >= 4096 and not thin_wide)
         or (4 < m <= 128 and n >= 32768)
-        or (m > 512 and (n <= 512 or n % 8 or k < 128))
+        or (m > 512 and ((n <= 512 and not tall_narrow) or n % 8 or k < 128))
         or a.dtype not in (torch.float16, torch.bfloat16)
         or a.dtype != b.dtype
         or a.dtype != c.dtype
@@ -2813,10 +2821,51 @@ def _packed_mm(a, b, c, m, n, k):
     sm_count = get_sm_count()
     if sm_count <= _H20_SM_COUNT:
         return False
+    if (
+        tma
+        and k % 256 == 0
+        and 32 <= m <= 64
+        and 1024 <= n <= 3072
+        and 256 <= k <= 1024
+        and triton.cdiv(m, 16) * triton.cdiv(n, 64) >= 96
+    ):
+        _packed_mm_cluster(a, b, c, m, n, k, nt, 16, 64, 256, 1)
+        return True
+    if tma and 192 <= m <= 512 and 2048 <= n <= 3072 and k % 128 == 0:
+        shorter_rows = m <= 256 and n >= 2560 and 2048 <= k <= 4096
+        longer_rows = m > 256 and n < 2560 and k >= 4096
+        if (shorter_rows or longer_rows) and triton.cdiv(m, 64) * triton.cdiv(n, 128) >= 64:
+            _packed_mm_cluster(a, b, c, m, n, k, nt, 64, 128, 128, 1, False)
+            return True
+
+    if tma and tall_narrow:
+        if n > 384 or (n > 128 and m > 2048):
+            bm, bn, bk, trans_dot = 64, 128, 128, False
+        else:
+            bm = 16 if m <= 1536 and n <= 128 else 32
+            bn, bk, trans_dot = 64, 256, True
+        _packed_mm_cluster(a, b, c, m, n, k, nt, bm, bn, bk, 1, trans_dot)
+        return True
+
+    if tma and 128 < m <= 512 and 128 < n <= 512 and k >= 2048 and k % 256 == 0:
+        bm = 32 if k >= 4096 and (n > 256 or (k >= 6144 and m < 384)) else 16
+        tiles = triton.cdiv(m, bm) * triton.cdiv(n, 64)
+        splits = 1
+        if k >= 6144 and bm == 32 and tiles <= 24:
+            splits = 4
+        elif k >= 4096 and (bm == 32 or k < 6144) and tiles <= 64:
+            splits = 2
+        blocks = k // 256
+        splits = min(splits, blocks & -blocks)
+        if splits not in _CLUSTER_MESH:
+            splits = 1
+        # Use the narrow WGMMA orientation to fit more independent row tiles.
+        _packed_mm_cluster(a, b, c, m, n, k, nt, bm, 64, 256, splits)
+        return True
+
     bm, bn = (16 if n < 1024 else 32), 64
     bk = 256 if k >= 1024 else (128 if k >= 256 else 32)
     stages, warps, trans_dot = 4, 4, True
-    thin_wide = m <= 4 and n >= 4096
     ordinary_grid = m <= 512 and not thin_wide
     if m > 512:
         # Large, packed projections use wider tiles to amortize repeated A
@@ -2843,33 +2892,7 @@ def _packed_mm(a, b, c, m, n, k):
     ):
         if tma and n >= 16 and k >= 1024 and 4 in _CLUSTER_MESH and k % 512 == 0:
             block_k = 256 if k % 1024 == 0 else 128
-            ad, bd = _packed_mm_descriptors(a, b, m, n, k, nt, bm, bn, block_k)
-            _batch_tma[(tiles, 1, 1)](
-                ad,
-                bd,
-                c,
-                c,
-                1,
-                0,
-                0,
-                0,
-                0,
-                False,
-                False,
-                m,
-                n,
-                k,
-                1,
-                bm,
-                bn,
-                block_k,
-                4,
-                nt,
-                True,
-                _CLUSTER_MESH[4],
-                num_stages=4,
-                num_warps=4,
-            )
+            _packed_mm_cluster(a, b, c, m, n, k, nt, bm, bn, block_k, 4)
             return True
         splits = min(32, max(2, triton.next_power_of_2(triton.cdiv(256, tiles))))
         _packed_mm_split(a, b, c, m, n, k, nt, tma, bm, bn, splits)
@@ -2911,6 +2934,37 @@ def _packed_mm(a, b, c, m, n, k):
         num_warps=warps,
     )
     return True
+
+
+def _packed_mm_cluster(a, b, c, m, n, k, nt, bm, bn, bk, splits, trans_dot=True):
+    ad, bd = _packed_mm_descriptors(a, b, m, n, k, nt, bm, bn, bk)
+    tiles = triton.cdiv(m, bm) * triton.cdiv(n, bn)
+    _batch_tma[(tiles, 1, 1)](
+        ad,
+        bd,
+        c,
+        c,
+        1,
+        0,
+        0,
+        0,
+        0,
+        False,
+        False,
+        m,
+        n,
+        k,
+        1,
+        bm,
+        bn,
+        bk,
+        splits,
+        nt,
+        trans_dot,
+        _CLUSTER_MESH.get(splits),
+        num_stages=4,
+        num_warps=4,
+    )
 
 
 def _packed_mm_descriptors(a, b, m, n, k, nt, bm, bn, bk):
