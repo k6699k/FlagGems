@@ -2834,7 +2834,9 @@ def _packed_mm(a, b, c, m, n, k):
     if tma and 192 <= m <= 512 and 2048 <= n <= 3072 and k % 128 == 0:
         shorter_rows = m <= 256 and n >= 2560 and 2048 <= k <= 4096
         longer_rows = m > 256 and n < 2560 and k >= 4096
-        if (shorter_rows or longer_rows) and triton.cdiv(m, 64) * triton.cdiv(n, 128) >= 64:
+        if (shorter_rows or longer_rows) and triton.cdiv(m, 64) * triton.cdiv(
+            n, 128
+        ) >= 64:
             _packed_mm_cluster(a, b, c, m, n, k, nt, 64, 128, 128, 1, False)
             return True
 
