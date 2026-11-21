@@ -33,6 +33,7 @@ from flag_gems.utils.triton_version_utils import HAS_TLE, HAS_TLE_DEVICE_MESH
 from .addmm import TensorDescriptor as _PackedTensorDescriptor
 from .addmm import _addmm_splitk, _addmm_tma
 from .bmm import _CLUSTER_MESH, _batch_tma
+from .mv import _row_mv
 
 logger = logging.getLogger(__name__)
 CACHE_USAGE_THRESHOLD = 0.8
@@ -1291,6 +1292,27 @@ def gemv_kernel(
 
 def gemv_mm(a, b, c, M, K):
     """Optimized matrix-vector multiplication for N=1 case"""
+    if (
+        K in (2048, 4096)
+        and M >= 16
+        and M * K < 2**31
+        and a.is_cuda
+        and a.dtype in (torch.float16, torch.bfloat16)
+        and a.dtype == b.dtype == c.dtype
+        and a.device == b.device == c.device
+        and a.is_contiguous()
+        and b.stride(0) == 1
+        and c.is_contiguous()
+        and c.shape == (M, 1)
+        and (os.getenv("USE_FLAGTUNE") == "0" or not runtime.flagtune_enabled("mm"))
+    ):
+        with torch_device_fn.device(a.device):
+            if get_sm_count() > _H20_SM_COUNT:
+                # Each CTA reduces a full contiguous row without exchanging partials.
+                warps = 16 if K == 4096 and M <= 512 else 8
+                _row_mv[(M,)](a, b, c, K, K, num_warps=warps)
+                return c
+
     logger.debug(
         "GEMS_NVIDIA MM_HOPPER, [mm scenario]: gemv (N=1), [shape info]: [%s, %s, 1](M, K, N)",
         M,
@@ -2773,6 +2795,7 @@ def _packed_mm(a, b, c, m, n, k):
     # Small and medium output grids need more CTAs than the legacy GEMM tile.
     # Keep the explicit autotuning entry points on their existing policies.
     thin_wide = n >= 4096 and (m <= 4 or (m <= 16 and k <= 1024 and n < 32768))
+    tall_skinny = m >= 1024 and n == 16 and k in (2048, 4096)
     tall_narrow = (
         1024 <= m <= 8192
         and 32 <= n <= 512
@@ -2788,7 +2811,10 @@ def _packed_mm(a, b, c, m, n, k):
         or k < 64
         or (4 < m <= 16 and n >= 4096 and not thin_wide)
         or (4 < m <= 128 and n >= 32768)
-        or (m > 512 and ((n <= 512 and not tall_narrow) or n % 8 or k < 128))
+        or (
+            m > 512
+            and ((n <= 512 and not (tall_narrow or tall_skinny)) or n % 8 or k < 128)
+        )
         or a.dtype not in (torch.float16, torch.bfloat16)
         or a.dtype != b.dtype
         or a.dtype != c.dtype
@@ -2824,10 +2850,10 @@ def _packed_mm(a, b, c, m, n, k):
     if (
         tma
         and k % 256 == 0
-        and 32 <= m <= 64
+        and 16 <= m <= 64
         and 1024 <= n <= 3072
         and 256 <= k <= 1024
-        and triton.cdiv(m, 16) * triton.cdiv(n, 64) >= 96
+        and triton.cdiv(m, 16) * triton.cdiv(n, 64) >= 32
     ):
         _packed_mm_cluster(a, b, c, m, n, k, nt, 16, 64, 256, 1)
         return True
@@ -2839,6 +2865,13 @@ def _packed_mm(a, b, c, m, n, k):
         ) >= 64:
             _packed_mm_cluster(a, b, c, m, n, k, nt, 64, 128, 128, 1, False)
             return True
+
+    if tma and tall_skinny:
+        splits = 1
+        if k == 4096 and m <= 4096 and 4 in _CLUSTER_MESH:
+            splits = 4 if m <= 1536 else 2
+        _packed_mm_cluster(a, b, c, m, n, k, nt, 64, 16, 256, splits, False)
+        return True
 
     if tma and tall_narrow:
         if n > 384 or (n > 128 and m > 2048):
@@ -2868,7 +2901,10 @@ def _packed_mm(a, b, c, m, n, k):
     bm, bn = (16 if n < 1024 else 32), 64
     bk = 256 if k >= 1024 else (128 if k >= 256 else 32)
     stages, warps, trans_dot = 4, 4, True
-    ordinary_grid = m <= 512 and not thin_wide
+    # A narrow WGMMA tile already gives deep medium projections enough work.
+    # Keep one CTA per output tile to avoid cluster scheduling and reduction.
+    medium_deep = 64 < m <= 128 and 1024 <= n <= 2048 and 2048 <= k <= 4096
+    ordinary_grid = m <= 512 and not (thin_wide or medium_deep)
     if m > 512:
         # Large, packed projections use wider tiles to amortize repeated A
         # loads. Keep at least one full wave before choosing a 256-column tile.

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
@@ -20,6 +22,8 @@ from flag_gems.ops.addmm import _addmm_impl
 from flag_gems.ops.copy import copy_
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import broadcastable_to
+
+from .bmm import _CLUSTER_MESH, _batch_tma
 
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
@@ -73,9 +77,13 @@ def _addmm_vector(
     kk = tl.arange(0, BK)
     # Reduce coalesced row-major B loads along K, keeping adjacent output
     # columns next to one another in memory.
-    if ROW_VECTOR and SB1 == 1 and K == BK:
-        vec = tl.load(A + rows * SA0 + kk * SA1).to(tl.float32)
-        mat = tl.load(B + kk[:, None] * SB0 + cols[None, :], cols[None, :] < N, 0)
+    if ROW_VECTOR and SB1 == 1 and K <= BK:
+        vec = tl.load(A + rows * SA0 + kk * SA1, kk < K, 0).to(tl.float32)
+        mat = tl.load(
+            B + kk[:, None] * SB0 + cols[None, :],
+            (kk[:, None] < K) & (cols[None, :] < N),
+            0,
+        )
         acc = tl.sum(mat.to(tl.float32) * vec[:, None], axis=0)
     else:
         products = tl.full((TILE, BK), 0, tl.float32)
@@ -254,7 +262,59 @@ def _addmm_tma(
     )
 
 
+@lru_cache(maxsize=1024)
+def _narrow_config(m, n, k):
+    if not (16 <= m <= 8192 and 16 <= n <= 512 and k >= 1024 and k % 256 == 0):
+        return None
+    # Map the 64-row WGMMA dimension onto the output columns. When these
+    # tiles underfill the SMs, CTAs in one cluster share the K reduction.
+    if m > 2048 and n > 128 or m > 512 and n > 384:
+        return 64, 128, 128, 1, False
+    if m > 512:
+        bm = 16 if m <= 1536 and n <= 128 else 32
+    else:
+        bm = (
+            32
+            if k >= 4096 and (n > 256 or (n >= 128 and k >= 6144 and m < 384))
+            else 16
+        )
+    tiles = triton.cdiv(m, bm) * triton.cdiv(n, 64)
+    splits = 1
+    if k >= 4096 and tiles <= 32:
+        splits = 4
+    elif k >= 2048 and tiles <= 64:
+        splits = 2
+    splits = min(splits, (k // 256) & -(k // 256))
+    return bm, 64, 256, splits if splits in _CLUSTER_MESH else 1, True
+
+
+@lru_cache(maxsize=1024)
 def _tma_config(m, n, k, device):
+    if m <= 64 and n >= 16384 and k >= 1024:
+        # Large weights dominate the traffic. Use wide contiguous TMA loads
+        # and fit short M dimensions inside one WGMMA row tile.
+        return 64, 128, 64, 4, 4, False
+    if m < 16 and n >= 2048 and k >= 512:
+        return 16, 64, 128, 4, 4, True
+    if 16 <= m <= 512 and n >= 1024:
+        # Let the grid fill a wave before expanding either tile dimension.
+        # A larger K tile is profitable when a single wave owns the full grid.
+        tiles = triton.cdiv(m, 64) * triton.cdiv(n, 128)
+        if k <= 256:
+            if m <= 128:
+                return 16, 128, min(64, triton.next_power_of_2(k)), 3, 4, True
+            return 64, 128, 64, 3, 4, False
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        if n >= 8192 and m >= 128 and k >= 1024:
+            large_tiles = triton.cdiv(m, 128) * triton.cdiv(n, 256)
+            if large_tiles >= sm_count // 2:
+                return 128, 256, 64, 3, 8, False
+        if n <= 8192 and sm_count // 2 <= tiles <= sm_count and k >= 1536:
+            return 64, 128, 128, 4, 4, False
+        if n <= 4096 and tiles > sm_count and k >= 1024:
+            return 64, 128, 64, 4, 4, False
+        if 64 <= triton.cdiv(m, 64) * triton.cdiv(n, 64) < 128 and k >= 1536:
+            return 64, 64, 128, 4, 4, False
     # For short/wide outputs, swap the dot operands so the hardware's 64-row
     # WGMMA tile runs along N. More, narrower M tiles expose more parallelism.
     if 16 <= m <= 512 and n >= 128 and k >= 512 and m * n <= 1048576:
@@ -299,27 +359,41 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
             return torch.zeros((m, n), device=device, dtype=mat1.dtype)
         return copy_(torch.empty((m, n), device=device, dtype=mat1.dtype), bias)
     row_vec = m <= 2
-    vector = row_vec or n == 1
+    wide = m < 16 and n >= 2048 and k >= 512
+    vector = row_vec and not wide or n == 1
     # Split long reductions whose output tiles alone underfill the GPU.
-    # Both regimes cap the FP32 workspace at 2 MiB.
+    # Use software partials for matrices narrower than a tensor-core tile.
     small_output = m * n <= 32768 and k >= 1024
     long_reduction = m * n <= 131072 and k >= 4096
-    split_k = m <= 256 and (small_output or long_reduction) and not vector
+    split_k = (
+        m <= 256
+        and (small_output or long_reduction)
+        or 256 < m <= 8192
+        and n < 16
+        and k >= 1024
+    ) and not (vector or wide)
+    narrow = (
+        _narrow_config(m, n, k) if hasattr(TensorDescriptor, "from_tensor") else None
+    )
     tma = (
         hasattr(TensorDescriptor, "from_tensor")
-        and m >= 16
+        and (m >= 16 or wide)
         and n >= 64
         and k >= 64
         and triton.cdiv(m, 16) * triton.cdiv(n, 64) >= 32
     )
     if tma and not small_output and m * n >= 65536:
         split_k = False
-    if not (vector or split_k or tma):
-        return _addmm_impl(bias, mat1, mat2, None, beta, alpha)
     sb0, sb1 = mat2.stride()
     trans_b = sb1 != 1
+    if (tma or narrow) and (
+        k % 8 or (not trans_b and n % 8) or mat1.data_ptr() % 16 or mat2.data_ptr() % 16
+    ):
+        narrow = None
+        tma = False
     if (
-        min(m, n, k) == 0
+        not (vector or split_k or tma or narrow)
+        or min(m, n, k) == 0
         or k != kb
         or mat1.dtype not in (torch.float16, torch.bfloat16)
         or mat2.dtype != mat1.dtype
@@ -329,16 +403,6 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
         or not mat1.is_contiguous()
         or not (
             (sb1 == 1 and (sb0 == n or k == 1)) or (sb0 == 1 and (sb1 == k or n == 1))
-        )
-        or (
-            tma
-            and not (vector or split_k)
-            and (
-                k % 8
-                or (not trans_b and n % 8)
-                or mat1.data_ptr() % 16
-                or mat2.data_ptr() % 16
-            )
         )
     ):
         return _addmm_impl(bias, mat1, mat2, None, beta, alpha)
@@ -357,13 +421,13 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
     if vector:
         # Warp-parallel reduction of a full K row is inexpensive for
         # decode; the 1024-thread CTA shortens very long reductions.
-        if k <= 16384 and k & (k - 1) == 0:
+        if k <= 16384 and (row_vec or k & (k - 1) == 0):
             tile = 4 if row_vec and not trans_b and n % 4 == 0 and n >= 32 else 1
             if row_vec and trans_b and k <= 256 and n >= 512:
                 # Reuse a short input row across contiguous rows of the weight.
                 tile = 32
-            bk = k
-            warps = 32 if k >= 8192 else (8 if row_vec else 4)
+            bk = triton.next_power_of_2(k)
+            warps = 32 if bk >= 8192 else (8 if row_vec else 4)
         else:
             tile, bk, warps = 4, min(triton.next_power_of_2(k), 512), 4
         grid = (triton.cdiv(n, tile), m) if row_vec else (triton.cdiv(m, tile), n)
@@ -388,9 +452,45 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
             beta_kind,
             num_warps=warps,
         )
+    elif narrow:
+        bm, bn, bk, splits, trans_dot = narrow
+        ad = TensorDescriptor(mat1, (m, k), (k, 1), [bm, bk])
+        bd = TensorDescriptor(
+            mat2,
+            (n, k) if trans_b else (k, n),
+            (k if trans_b else n, 1),
+            [bn, bk] if trans_b else [bk, bn],
+        )
+        _batch_tma[(triton.cdiv(m, bm) * triton.cdiv(n, bn), 1, 1)](
+            ad,
+            bd,
+            out,
+            bias,
+            alpha,
+            beta,
+            0,
+            *si,
+            True,
+            beta_kind != 0,
+            m,
+            n,
+            k,
+            1,
+            bm,
+            bn,
+            bk,
+            splits,
+            trans_b,
+            trans_dot,
+            _CLUSTER_MESH.get(splits),
+            num_stages=4,
+            num_warps=4,
+        )
     elif split_k:
-        splits = 16 if small_output else 4
-        bm, bn, bk = 16, 32, 64
+        splits = 16 if small_output or n < 16 else 4
+        if n < 16 and k >= 8192:
+            splits = 32
+        bm, bn, bk = 16, 16 if n < 16 else 32, 64
         partials = torch.empty((splits, m, n), device=mat1.device, dtype=torch.float32)
         _addmm_splitk[(triton.cdiv(m, bm), triton.cdiv(n, bn), splits)](
             mat1,

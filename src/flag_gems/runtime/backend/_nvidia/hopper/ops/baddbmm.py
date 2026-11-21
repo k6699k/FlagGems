@@ -18,10 +18,10 @@ from flag_gems.ops.baddbmm import BaddbmmFunction
 from flag_gems.ops.baddbmm import baddbmm as generic_baddbmm
 from flag_gems.ops.copy import copy_
 
-from .bmm import _batch_product, _supported
+from .bmm import _batch_path, _batch_product
 
 
-def _forward(bias, A, B, beta, alpha):
+def _forward(bias, A, B, beta, alpha, path):
     if alpha == 0 and beta in (0, 1):
         shape = (A.shape[0], A.shape[1], B.shape[2])
         expanded = bias.expand(shape)
@@ -29,14 +29,18 @@ def _forward(bias, A, B, beta, alpha):
             return torch.zeros(shape, dtype=bias.dtype, device=bias.device)
         out = torch.empty(shape, dtype=bias.dtype, device=bias.device)
         return copy_(out, expanded)
-    return _batch_product(A, B, bias, alpha, beta)
+    return _batch_product(A, B, path, bias, alpha, beta)
 
 
 class _HopperBaddbmm(BaddbmmFunction):
     @staticmethod
-    def forward(ctx, bias, A, B, beta, alpha):
+    def forward(ctx, bias, A, B, beta, alpha, path):
         BaddbmmFunction._save_context(ctx, bias, A, B, beta, alpha)
-        return _forward(bias, A, B, beta, alpha)
+        return _forward(bias, A, B, beta, alpha, path)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return (*BaddbmmFunction.backward(ctx, grad_output), None)
 
 
 def baddbmm(bias, A, B, beta=1.0, alpha=1.0):
@@ -44,11 +48,11 @@ def baddbmm(bias, A, B, beta=1.0, alpha=1.0):
         raise RuntimeError(
             "baddbmm expects bias to have the same dtype and device as the matrices"
         )
-    supported = _supported(A, B, fused_bias=True, ignore_bias=beta == 0)
-    if not supported and not (alpha == 0 and beta in (0, 1)):
+    path = _batch_path(A, B, fused_bias=True, ignore_bias=beta == 0)
+    if path is None and not (alpha == 0 and beta in (0, 1)):
         return generic_baddbmm(bias, A, B, beta, alpha)
     if torch.is_grad_enabled() and (
         A.requires_grad or B.requires_grad or bias.requires_grad
     ):
-        return _HopperBaddbmm.apply(bias, A, B, beta, alpha)
-    return _forward(bias, A, B, beta, alpha)
+        return _HopperBaddbmm.apply(bias, A, B, beta, alpha, path)
+    return _forward(bias, A, B, beta, alpha, path)
