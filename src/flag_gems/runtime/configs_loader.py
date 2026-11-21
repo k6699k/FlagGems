@@ -170,6 +170,9 @@ class TunedConfigLoader(object):
             )
         else:
             fields = {
+                "hopper_addmm_tma": ("BLOCK_M", "BLOCK_N", "BLOCK_K"),
+                "hopper_addmm_splitk": ("BLOCK_M", "BLOCK_N", "BLOCK_K"),
+                "hopper_batch_tma": ("BLOCK_M", "BLOCK_N", "BLOCK_K"),
                 "mm_syrk": ("BT", "BK", "pipeline", "scenario"),
                 "mm_pack": ("BR", "BC"),
                 "mm_reduce": ("BLOCK",),
@@ -1348,6 +1351,14 @@ class TunedConfigLoader(object):
                 "mm_sqmma", yaml_op_name="mm_general_tma"
             ),
             "mm_general_tma": self._build_single_expand_spec("mm_general_tma"),
+            **{
+                name: self._build_single_expand_spec(name)
+                for name in (
+                    "hopper_addmm_tma",
+                    "hopper_addmm_splitk",
+                    "hopper_batch_tma",
+                )
+            },
             "mm_tma_transposed_direct": self._build_single_expand_spec(
                 "mm_tma_transposed_direct"
             ),

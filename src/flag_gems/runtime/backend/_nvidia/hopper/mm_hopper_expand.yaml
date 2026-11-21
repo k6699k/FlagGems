@@ -12,6 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+hopper_addmm_tma: &hopper_packed_tma_expand
+  - config:
+    include_default_configs: true
+    param_map: &hopper_packed_gemm_params
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+        BLOCK_K: block_k
+      num_stages: stages
+      num_warps: warps
+    block_m: [16, 32, 64, 128]
+    block_n: [16, 32, 64, 128, 256]
+    block_k: [32, 64, 128, 256]
+    stages: [2, 3, 4]
+    warps: [4, 8]
+hopper_batch_tma: *hopper_packed_tma_expand
+
+hopper_addmm_splitk:
+  - config:
+    include_default_configs: true
+    param_map: *hopper_packed_gemm_params
+    block_m: [16, 32, 64]
+    block_n: [16, 32, 64]
+    block_k: [32, 64, 128, 256]
+    stages: [2, 3, 4]
+    warps: [4, 8]
+
 mm_general_tma:
   - config:
     param_map:

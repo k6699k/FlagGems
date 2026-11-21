@@ -20,49 +20,16 @@ import triton.language as tl
 
 from flag_gems.ops.bmm import bmm as generic_bmm
 from flag_gems.runtime import flagtune_enabled, torch_device_fn
-from flag_gems.utils.triton_version_utils import HAS_TLE_DEVICE_MESH
 
-try:
-    from triton.tools.tensor_descriptor import TensorDescriptor
-except ImportError:
-    TensorDescriptor = None
-
-
-tle = None
-_CLUSTER_MESH = {}
-if HAS_TLE_DEVICE_MESH:
-    try:
-        import triton.experimental.tle.language as tle
-
-        if all(
-            hasattr(tle, name) for name in ("remote", "distributed_barrier", "shard_id")
-        ) and all(hasattr(tle.gpu, name) for name in ("smem", "alloc", "local_ptr")):
-            _CLUSTER_MESH = {
-                size: tle.device_mesh({"block_cluster": [("cluster_x", size)]})
-                for size in (2, 4)
-            }
-    except (ImportError, AttributeError, TypeError, ValueError):
-        pass
-
-
-@triton.jit
-def _store_result(
-    value,
-    bias,
-    out,
-    offsets,
-    mask,
-    bias_offsets,
-    alpha,
-    beta,
-    HAS_BIAS: tl.constexpr,
-    READ_BIAS: tl.constexpr,
-):
-    if HAS_BIAS:
-        value *= alpha
-        if READ_BIAS:
-            value += beta * tl.load(bias + bias_offsets, mask, other=0).to(tl.float32)
-    tl.store(out + offsets, value, mask)
+from .mm import (
+    _CLUSTER_MESH,
+    TensorDescriptor,
+    _baddbmm_tma,
+    _batch_mm,
+    _batched_mm_tma_grid,
+    _bmm_tma,
+    _store_batched_mm_result,
+)
 
 
 @triton.jit
@@ -108,7 +75,7 @@ def _batch_gemv(
     )
     b = tl.load(vector + batch * vb + v * vr + k * vk, k < K, other=0)
     acc = tl.sum(a.to(tl.float32) * b[None, :].to(tl.float32), axis=1)
-    _store_result(
+    _store_batched_mm_result(
         acc,
         bias,
         out,
@@ -120,173 +87,6 @@ def _batch_gemv(
         HAS_BIAS,
         READ_BIAS,
     )
-
-
-@triton.jit
-def _batch_mm(
-    a,
-    b,
-    bias,
-    out,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    sa: tl.constexpr,
-    am: tl.constexpr,
-    ak: tl.constexpr,
-    sb: tl.constexpr,
-    bk: tl.constexpr,
-    bn: tl.constexpr,
-    cb: tl.constexpr,
-    cm: tl.constexpr,
-    cn: tl.constexpr,
-    alpha,
-    beta,
-    HAS_BIAS: tl.constexpr,
-    READ_BIAS: tl.constexpr,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-    BK: tl.constexpr,
-):
-    batch = tl.program_id(2).to(tl.int64)
-    m = tl.program_id(0) * BM + tl.arange(0, BM)
-    n = tl.program_id(1) * BN + tl.arange(0, BN)
-    k = tl.arange(0, BK)
-    if M * max(am, cm, N) >= 2**31:
-        m = m.to(tl.int64)
-    if N * bn >= 2**31 or N * cn >= 2**31:
-        n = n.to(tl.int64)
-    if BK * ak >= 2**31 or BK * bk >= 2**31:
-        k = k.to(tl.int64)
-    ap = a + batch * sa + m[:, None] * am + k[None, :] * ak
-    bp = b + batch * sb + k[:, None] * bk + n[None, :] * bn
-    acc = tl.full((BM, BN), 0, tl.float32)
-    for i in range(tl.cdiv(K, BK)):
-        x = tl.load(ap, (m[:, None] < M) & (i * BK + k[None, :] < K), other=0)
-        y = tl.load(bp, (n[None, :] < N) & (i * BK + k[:, None] < K), other=0)
-        acc = tl.dot(x, y, acc)
-        ap += BK * ak
-        bp += BK * bk
-    mask = (m[:, None] < M) & (n[None, :] < N)
-    offsets = batch * M * N + m[:, None] * N + n[None, :]
-    bias_offsets = batch * cb + m[:, None] * cm + n[None, :] * cn
-    _store_result(
-        acc, bias, out, offsets, mask, bias_offsets, alpha, beta, HAS_BIAS, READ_BIAS
-    )
-
-
-@triton.jit
-def _batch_tma(
-    ad,
-    bd,
-    out,
-    bias,
-    alpha,
-    beta,
-    CB: tl.constexpr,
-    CM: tl.constexpr,
-    CN: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    READ_BIAS: tl.constexpr,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    B: tl.constexpr,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-    BK: tl.constexpr,
-    SPLIT: tl.constexpr,
-    NT: tl.constexpr,
-    TRAN: tl.constexpr,
-    MESH: tl.constexpr,
-):
-    tile = tl.program_id(0) // SPLIT
-    if SPLIT > 1 and not NT and B >= 4:
-        # Adjacent clusters cover the same output tile in different batches.
-        z = tile % B
-        tile = tile // B
-    else:
-        z = tl.program_id(2)
-    if SPLIT > 1:
-        s = tle.shard_id(MESH, "cluster_x")
-    else:
-        s = 0
-    tiles_n = tl.cdiv(N, BN)
-    if SPLIT == 1 and M >= 256 and N >= 512:
-        # Visit nearby row tiles together so they reuse the same B tile in L2.
-        tiles_per_group = 8 * tiles_n
-        first_m = tile // tiles_per_group * 8
-        group_m = tl.minimum(tl.cdiv(M, BM) - first_m, 8)
-        in_group = tile % tiles_per_group
-        m = (first_m + in_group % group_m) * BM
-        n = in_group // group_m * BN
-    else:
-        m = tile // tiles_n * BM
-        n = tile % tiles_n * BN
-    if TRAN:
-        acc = tl.full((BN, BM), 0, tl.float32)
-    else:
-        acc = tl.full((BM, BN), 0, tl.float32)
-    for i in range(K // BK // SPLIT):
-        if SPLIT > 1 and not NT and B >= 4:
-            k = (i * SPLIT + s) * BK
-        else:
-            k = (s * (K // BK // SPLIT) + i) * BK
-        a = ad.load([z * M + m, k])
-        if NT:
-            bt = bd.load([z * N + n, k])
-        else:
-            bt = tl.trans(bd.load([z * K + k, n]))
-        if TRAN:
-            acc = tl.dot(bt, tl.trans(a), acc)
-        else:
-            acc = tl.dot(a, tl.trans(bt), acc)
-    if TRAN:
-        v = tl.trans(acc)
-    else:
-        v = acc
-    rm = tl.broadcast_to(tl.arange(0, BM)[:, None], (BM, BN))
-    rn = tl.broadcast_to(tl.arange(0, BN)[None, :], (BM, BN))
-    if SPLIT > 1:
-        workspace = tle.gpu.alloc([BM, BN], tl.float32, layout=None, scope=tle.gpu.smem)
-        tl.store(tle.gpu.local_ptr(workspace, (rm, rn)), v)
-        tle.distributed_barrier(MESH)
-    if s == 0:
-        if SPLIT > 1:
-            for peer_id in tl.static_range(1, SPLIT):
-                peer = tle.remote(workspace, peer_id, scope=MESH)
-                v += tl.load(tle.gpu.local_ptr(peer, (rm, rn)))
-        rows, cols = m + rm, n + rn
-        if B * M * N >= 2**31:
-            offsets = z.to(tl.int64) * M * N + rows.to(tl.int64) * N + cols
-        else:
-            offsets = z * M * N + rows * N + cols
-        if B * CB + M * CM + N * CN >= 2**31:
-            bias_offsets = (
-                z.to(tl.int64) * CB + rows.to(tl.int64) * CM + cols.to(tl.int64) * CN
-            )
-        else:
-            bias_offsets = z * CB + rows * CM + cols * CN
-        mask = True
-        if M % BM:
-            mask = mask & (rows < M)
-        if N % BN:
-            mask = mask & (cols < N)
-        _store_result(
-            v,
-            bias,
-            out,
-            offsets,
-            mask,
-            bias_offsets,
-            alpha,
-            beta,
-            HAS_BIAS,
-            READ_BIAS,
-        )
-    if SPLIT > 1:
-        # Keep all peer CTAs resident until rank zero has read their partials.
-        tle.distributed_barrier(MESH)
 
 
 def _use_narrow_cluster(m, n, k):
@@ -394,13 +194,8 @@ def _launch_tma(A, B, out, bias, alpha, beta, bias_strides, has_bias):
         B, [batch * height, width], [width, 1], [bn, bk] if nt else [bk, bn]
     )
     read_bias = has_bias and beta != 0
-    tiles = triton.cdiv(m, bm) * triton.cdiv(n, bn)
-    grid = (
-        (tiles * batch, 1, 1)
-        if splits > 1 and not nt and batch >= 4
-        else (tiles, 1, batch)
-    )
-    _batch_tma[grid](
+    kernel = _baddbmm_tma if has_bias else _bmm_tma
+    kernel[_batched_mm_tma_grid](
         ad,
         bd,
         out,
@@ -421,8 +216,8 @@ def _launch_tma(A, B, out, bias, alpha, beta, bias_strides, has_bias):
         nt,
         trans_dot,
         _CLUSTER_MESH.get(splits),
-        num_stages=stages,
-        num_warps=warps,
+        PLAN_STAGES=stages,
+        PLAN_WARPS=warps,
     )
 
 
@@ -504,10 +299,10 @@ def _batch_path(A, B, *, fused_bias=False, ignore_bias=False):
         and n <= 512
         and (1024 <= k <= 8192 or (16 <= k <= 128 and min(m, n) >= 16))
     )
-    if not (gemv or compact) and flagtune_enabled("baddbmm" if fused_bias else "bmm"):
-        return None
     if _can_tma(A, B, batch, m, n, k):
         return "tma"
+    if not (gemv or compact) and flagtune_enabled("baddbmm" if fused_bias else "bmm"):
+        return None
     if gemv:
         return "gemv"
     if compact or (fused_bias and B.stride(1) == 1 and 4 < n <= 16 * 65535 and m > 4):

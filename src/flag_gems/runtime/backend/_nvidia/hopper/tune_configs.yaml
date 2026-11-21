@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+hopper_addmm_tma: &hopper_packed_gemm_default
+  - gen: true
+    param_map:
+      META: metas
+      num_stages: stages
+      num_warps: warps
+    metas: [{}]
+    stages: [1, 2, 3, 4, 5]
+    warps: [8, 4]
+hopper_addmm_splitk: *hopper_packed_gemm_default
+hopper_batch_tma: *hopper_packed_gemm_default
+
 mm:
   - META:
       BLOCK_M: 64

@@ -23,23 +23,17 @@ from flag_gems.ops.copy import copy_
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import broadcastable_to
 
-from .bmm import _CLUSTER_MESH, _batch_tma
-
-try:
-    from triton.tools.tensor_descriptor import TensorDescriptor
-except ImportError:
-    TensorDescriptor = None
-
-
-@triton.jit
-def _combine(acc, bias, alpha, beta, ALPHA_ONE: tl.constexpr, BETA: tl.constexpr):
-    if not ALPHA_ONE:
-        acc = acc * alpha
-    if BETA == 1:
-        acc = acc + bias
-    elif BETA != 0:
-        acc = acc + beta * bias
-    return acc
+from .mm import (
+    _CLUSTER_MESH,
+    TensorDescriptor,
+    _addmm_batch_tma,
+    _addmm_epilogue,
+    _addmm_splitk,
+    _addmm_tma,
+    _batched_mm_tma_grid,
+    _packed_mm_splitk_grid,
+    _packed_mm_tma_grid,
+)
 
 
 @triton.jit
@@ -114,51 +108,8 @@ def _addmm_vector(
         bias = 0.0
     tl.store(
         Out + rows * SO0 + cols * SO1,
-        _combine(acc, bias, alpha, beta, ALPHA_ONE, BETA),
+        _addmm_epilogue(acc, bias, alpha, beta, ALPHA_ONE, BETA),
         valid,
-    )
-
-
-@triton.jit
-def _addmm_splitk(
-    A,
-    B,
-    Partials,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    SB0: tl.constexpr,
-    SB1: tl.constexpr,
-    SPLITS: tl.constexpr,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-    BK: tl.constexpr,
-):
-    # Each CTA handles consecutive K tiles. FP32 partials retain the full
-    # accumulator precision until the bias and scaling are applied.
-    rows = tl.program_id(0) * BM + tl.arange(0, BM)
-    cols = tl.program_id(1) * BN + tl.arange(0, BN)
-    split = tl.program_id(2)
-    tiles = tl.cdiv(K, SPLITS * BK)
-    start = split * tiles * BK + tl.arange(0, BK)
-    acc = tl.full((BM, BN), 0, tl.float32)
-    for i in range(tiles):
-        kk = start + i * BK
-        a = tl.load(
-            A + rows[:, None] * K + kk[None, :],
-            (rows[:, None] < M) & (kk[None, :] < K),
-            0.0,
-        )
-        b = tl.load(
-            B + kk[:, None] * SB0 + cols[None, :] * SB1,
-            (kk[:, None] < K) & (cols[None, :] < N),
-            0.0,
-        )
-        acc = tl.dot(a, b, acc)
-    tl.store(
-        Partials + split * M * N + rows[:, None] * N + cols[None, :],
-        acc,
-        (rows[:, None] < M) & (cols[None, :] < N),
     )
 
 
@@ -194,71 +145,8 @@ def _addmm_finish(
         bias = tl.load(Bias + rows * SI0 + cols * SI1, valid, 0).to(tl.float32)
     else:
         bias = 0.0
-    tl.store(Out + offs, _combine(acc, bias, alpha, beta, ALPHA_ONE, BETA), valid)
-
-
-@triton.jit
-def _addmm_tma(
-    A,
-    B,
-    Bias,
-    Out,
-    alpha,
-    beta,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    SI0: tl.constexpr,
-    SI1: tl.constexpr,
-    SO0: tl.constexpr,
-    SO1: tl.constexpr,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-    BK: tl.constexpr,
-    TRANS_B: tl.constexpr,
-    ALPHA_ONE: tl.constexpr,
-    BETA: tl.constexpr,
-    TRANS_DOT: tl.constexpr = False,
-):
-    pid = tl.program_id(0)
-    # Group adjacent row tiles to reuse the same B tile from L2.
-    num_m = tl.cdiv(M, BM)
-    num_n = tl.cdiv(N, BN)
-    group = pid // (8 * num_n)
-    first_m = group * 8
-    group_m = tl.minimum(num_m - first_m, 8)
-    in_group = pid % (8 * num_n)
-    m = (first_m + in_group % group_m) * BM
-    n = (in_group // group_m) * BN
-    if TRANS_DOT:
-        acc = tl.full((BN, BM), 0, tl.float32)
-    else:
-        acc = tl.full((BM, BN), 0, tl.float32)
-    for i in range(tl.cdiv(K, BK)):
-        a = A.load([m, i * BK])
-        if TRANS_B:
-            b = tl.trans(B.load([n, i * BK]))
-        else:
-            b = B.load([i * BK, n])
-        if TRANS_DOT:
-            acc = tl.dot(tl.trans(b), tl.trans(a), acc)
-        else:
-            acc = tl.dot(a, b, acc)
-    if TRANS_DOT:
-        acc = tl.trans(acc)
-    rows = (m + tl.arange(0, BM)).to(tl.int64)
-    cols = (n + tl.arange(0, BN)).to(tl.int64)
-    valid = (rows[:, None] < M) & (cols[None, :] < N)
-    if BETA != 0:
-        bias = tl.load(Bias + rows[:, None] * SI0 + cols[None, :] * SI1, valid, 0).to(
-            tl.float32
-        )
-    else:
-        bias = 0.0
     tl.store(
-        Out + rows[:, None] * SO0 + cols[None, :] * SO1,
-        _combine(acc, bias, alpha, beta, ALPHA_ONE, BETA),
-        valid,
+        Out + offs, _addmm_epilogue(acc, bias, alpha, beta, ALPHA_ONE, BETA), valid
     )
 
 
@@ -461,7 +349,7 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
             (k if trans_b else n, 1),
             [bn, bk] if trans_b else [bk, bn],
         )
-        _batch_tma[(triton.cdiv(m, bm) * triton.cdiv(n, bn), 1, 1)](
+        _addmm_batch_tma[_batched_mm_tma_grid](
             ad,
             bd,
             out,
@@ -483,8 +371,8 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
             trans_b,
             trans_dot,
             _CLUSTER_MESH.get(splits),
-            num_stages=4,
-            num_warps=4,
+            PLAN_STAGES=4,
+            PLAN_WARPS=4,
         )
     elif split_k:
         splits = 16 if small_output or n < 16 else 4
@@ -492,18 +380,24 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
             splits = 32
         bm, bn, bk = 16, 16 if n < 16 else 32, 64
         partials = torch.empty((splits, m, n), device=mat1.device, dtype=torch.float32)
-        _addmm_splitk[(triton.cdiv(m, bm), triton.cdiv(n, bn), splits)](
+        _addmm_splitk[_packed_mm_splitk_grid](
             mat1,
             mat2,
             partials,
             m,
             n,
             k,
+            *mat1.stride(),
             *mat2.stride(),
+            partials.stride(1),
+            partials.stride(2),
+            partials.stride(0),
             splits,
             bm,
             bn,
             bk,
+            PLAN_STAGES=3,
+            PLAN_WARPS=4,
         )
         _addmm_finish[(triton.cdiv(m * n, 128),)](
             partials,
@@ -528,7 +422,7 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
             (sb1, sb0) if trans_b else (sb0, sb1),
             [bn, bk] if trans_b else [bk, bn],
         )
-        _addmm_tma[(triton.cdiv(m, bm) * triton.cdiv(n, bn),)](
+        _addmm_tma[_packed_mm_tma_grid](
             a,
             b,
             bias,
@@ -547,7 +441,7 @@ def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
             alpha == 1,
             beta_kind,
             TRANS_DOT=trans_dot,
-            num_stages=stages,
-            num_warps=warps,
+            PLAN_STAGES=stages,
+            PLAN_WARPS=warps,
         )
     return out

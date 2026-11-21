@@ -24,16 +24,20 @@ import triton.language as tl
 from flag_gems import runtime
 from flag_gems.ops.mm_streamk import streamk_mm
 from flag_gems.runtime import torch_device_fn
+from flag_gems.runtime.common import OP_KEY_ORDERS
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.device_info import get_device_capability, get_sm_count
 from flag_gems.utils.libentry import LibTuner
 from flag_gems.utils.triton_version_utils import HAS_TLE, HAS_TLE_DEVICE_MESH
 
-from .addmm import TensorDescriptor as _PackedTensorDescriptor
-from .addmm import _addmm_splitk, _addmm_tma
-from .bmm import _CLUSTER_MESH, _batch_tma
 from .mv import _row_mv
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except ImportError:
+    TensorDescriptor = None
+
 
 logger = logging.getLogger(__name__)
 CACHE_USAGE_THRESHOLD = 0.8
@@ -44,6 +48,23 @@ _SHARED_MEM_SAFETY_MARGIN_BYTES = 1024
 _TMA_TRANSPOSE_BLOCK_N = 64
 _H20_SM_COUNT = 78
 _H20_NEAR_WAVE_MIN_CTAS = 70
+
+
+tle = None
+_CLUSTER_MESH = {}
+if HAS_TLE_DEVICE_MESH:
+    try:
+        import triton.experimental.tle.language as tle
+
+        if all(
+            hasattr(tle, name) for name in ("remote", "distributed_barrier", "shard_id")
+        ) and all(hasattr(tle.gpu, name) for name in ("smem", "alloc", "local_ptr")):
+            _CLUSTER_MESH = {
+                size: tle.device_mesh({"block_cluster": [("cluster_x", size)]})
+                for size in (2, 4)
+            }
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
 
 
 def _get_shared_memory_limit_bytes():
@@ -642,6 +663,16 @@ def general_mm(a, b, c, M, N, K, op_name="mm"):
 
 
 @triton.jit
+def _load_tma_gemm_tiles(a_desc, b_desc, m, n, ak, bk, B_TRANSPOSED: tl.constexpr):
+    a = a_desc.load([m, ak])
+    if B_TRANSPOSED:
+        b_t = b_desc.load([n, bk])
+    else:
+        b_t = tl.trans(b_desc.load([bk, n]))
+    return a, b_t
+
+
+@triton.jit
 def mm_kernel_tma_transposed_splitk_partials(
     a_desc,
     b_desc,
@@ -674,11 +705,9 @@ def mm_kernel_tma_transposed_splitk_partials(
     accumulator_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
     for k_block in range(k_begin, k_end):
         offset_k = (k_block * BLOCK_K).to(tl.int32)
-        a = a_desc.load([offset_m, offset_k])
-        if B_ROW_MAJOR:
-            b_t = tl.trans(b_desc.load([offset_k, offset_n]))
-        else:
-            b_t = b_desc.load([offset_n, offset_k])
+        a, b_t = _load_tma_gemm_tiles(
+            a_desc, b_desc, offset_m, offset_n, offset_k, offset_k, not B_ROW_MAJOR
+        )
         accumulator_t = tl.dot(
             b_t,
             tl.trans(a),
@@ -730,11 +759,9 @@ def mm_kernel_tma_transposed_direct(
     accumulator_t = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
         offset_k = (k_block * BLOCK_K).to(tl.int32)
-        a = a_desc.load([offset_m, offset_k])
-        if B_ROW_MAJOR:
-            b_t = tl.trans(b_desc.load([offset_k, offset_n]))
-        else:
-            b_t = b_desc.load([offset_n, offset_k])
+        a, b_t = _load_tma_gemm_tiles(
+            a_desc, b_desc, offset_m, offset_n, offset_k, offset_k, not B_ROW_MAJOR
+        )
         accumulator_t = tl.dot(
             b_t,
             tl.trans(a),
@@ -1307,9 +1334,13 @@ def gemv_mm(a, b, c, M, K):
         and (os.getenv("USE_FLAGTUNE") == "0" or not runtime.flagtune_enabled("mm"))
     ):
         with torch_device_fn.device(a.device):
-            if get_sm_count() > _H20_SM_COUNT:
+            sm_count = get_sm_count()
+            h20_fp16 = (
+                sm_count == _H20_SM_COUNT and a.dtype == torch.float16 and M <= 2048
+            )
+            if sm_count > _H20_SM_COUNT or h20_fp16:
                 # Each CTA reduces a full contiguous row without exchanging partials.
-                warps = 16 if K == 4096 and M <= 512 else 8
+                warps = 16 if not h20_fp16 and K == 4096 and M <= 512 else 8
                 _row_mv[(M,)](a, b, c, K, K, num_warps=warps)
                 return c
 
@@ -1440,6 +1471,23 @@ def splitk_gemv_mm(a, b, c, M, N, K):
 
 
 @triton.jit
+def _load_splitk_gemm_tiles(
+    A, B, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, rows, cols, k
+):
+    a = tl.load(
+        A + rows[:, None] * stride_am + k[None, :] * stride_ak,
+        mask=(rows[:, None] < M) & (k[None, :] < K),
+        other=0.0,
+    )
+    b = tl.load(
+        B + k[:, None] * stride_bk + cols[None, :] * stride_bn,
+        mask=(k[:, None] < K) & (cols[None, :] < N),
+        other=0.0,
+    )
+    return a, b
+
+
+@triton.jit
 def _mm_kernel_splitk(
     A,
     B,
@@ -1484,15 +1532,19 @@ def _mm_kernel_splitk(
         offset_k = k * BLOCK_K
         offs_k = offset_k + tl.arange(0, BLOCK_K)
 
-        a = tl.load(
-            A + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak,
-            mask=(offs_am[:, None] < M) & (offs_k[None, :] < K),
-            other=0.0,
-        )
-        b = tl.load(
-            B + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn,
-            mask=(offs_k[:, None] < K) & (offs_bn[None, :] < N),
-            other=0.0,
+        a, b = _load_splitk_gemm_tiles(
+            A,
+            B,
+            M,
+            N,
+            K,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            offs_am,
+            offs_bn,
+            offs_k,
         )
         acc += tl.dot(a, b, out_dtype=tl.float32, allow_tf32=False)
 
@@ -2791,30 +2843,583 @@ def cluster_remote_mm(a, b, c, M, N, K):
     return c
 
 
-def _packed_mm(a, b, c, m, n, k):
-    # Small and medium output grids need more CTAs than the legacy GEMM tile.
-    # Keep the explicit autotuning entry points on their existing policies.
-    thin_wide = n >= 4096 and (m <= 4 or (m <= 16 and k <= 1024 and n < 32768))
-    tall_skinny = m >= 1024 and n == 16 and k in (2048, 4096)
-    tall_narrow = (
-        1024 <= m <= 8192
-        and 32 <= n <= 512
-        and (n <= 256 or m < 2048)
-        and k >= 1024
-        and k % 256 == 0
+@triton.jit
+def _addmm_epilogue(
+    acc, bias, alpha, beta, ALPHA_ONE: tl.constexpr, BETA: tl.constexpr
+):
+    if not ALPHA_ONE:
+        acc = acc * alpha
+    if BETA == 1:
+        acc = acc + bias
+    elif BETA != 0:
+        acc = acc + beta * bias
+    return acc
+
+
+@triton.jit
+def _store_batched_mm_result(
+    value,
+    bias,
+    out,
+    offsets,
+    mask,
+    bias_offsets,
+    alpha,
+    beta,
+    HAS_BIAS: tl.constexpr,
+    READ_BIAS: tl.constexpr,
+):
+    if HAS_BIAS:
+        value *= alpha
+        if READ_BIAS:
+            value += beta * tl.load(bias + bias_offsets, mask, other=0).to(tl.float32)
+    tl.store(out + offsets, value, mask)
+
+
+@triton.jit
+def _batch_mm(
+    a,
+    b,
+    bias,
+    out,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    sa: tl.constexpr,
+    am: tl.constexpr,
+    ak: tl.constexpr,
+    sb: tl.constexpr,
+    bk: tl.constexpr,
+    bn: tl.constexpr,
+    cb: tl.constexpr,
+    cm: tl.constexpr,
+    cn: tl.constexpr,
+    alpha,
+    beta,
+    HAS_BIAS: tl.constexpr,
+    READ_BIAS: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    batch = tl.program_id(2).to(tl.int64)
+    m = tl.program_id(0) * BM + tl.arange(0, BM)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    k = tl.arange(0, BK)
+    if M * max(am, cm, N) >= 2**31:
+        m = m.to(tl.int64)
+    if N * bn >= 2**31 or N * cn >= 2**31:
+        n = n.to(tl.int64)
+    if BK * ak >= 2**31 or BK * bk >= 2**31:
+        k = k.to(tl.int64)
+    ap = a + batch * sa + m[:, None] * am + k[None, :] * ak
+    bp = b + batch * sb + k[:, None] * bk + n[None, :] * bn
+    acc = tl.full((BM, BN), 0, tl.float32)
+    for i in range(tl.cdiv(K, BK)):
+        x = tl.load(ap, (m[:, None] < M) & (i * BK + k[None, :] < K), other=0)
+        y = tl.load(bp, (n[None, :] < N) & (i * BK + k[:, None] < K), other=0)
+        acc = tl.dot(x, y, acc)
+        ap += BK * ak
+        bp += BK * bk
+    mask = (m[:, None] < M) & (n[None, :] < N)
+    offsets = batch * M * N + m[:, None] * N + n[None, :]
+    bias_offsets = batch * cb + m[:, None] * cm + n[None, :] * cn
+    _store_batched_mm_result(
+        acc, bias, out, offsets, mask, bias_offsets, alpha, beta, HAS_BIAS, READ_BIAS
     )
+
+
+def _packed_gemm_tile(meta):
+    return (
+        meta.get("BLOCK_M", 0) or meta["PLAN_BM"],
+        meta.get("BLOCK_N", 0) or meta["PLAN_BN"],
+        meta.get("BLOCK_K", 0) or meta["PLAN_BK"],
+    )
+
+
+def _prune_packed_gemm_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    stages, warps = args["PLAN_STAGES"], args["PLAN_WARPS"]
+    max_m = max(64, triton.next_power_of_2(args["M"]))
+    max_n = max(64, triton.next_power_of_2(args["N"]))
+    split = args.get("SPLIT", 1)
+    trans_dot = args.get("TRAN", args.get("TRANS_DOT"))
+    pruned = []
+    for config in configs:
+        if not config.kwargs:
+            if config.num_warps == warps and config.num_stages in (stages, stages - 1):
+                pruned.append(config)
+            continue
+
+        bm, bn, bk = _packed_gemm_tile({**args, **config.kwargs})
+        if bm > max_m or bn > max_n or bm * bn > 128 * 32 * config.num_warps:
+            continue
+        # TMA descriptors use half precision, and the cluster keeps one FP32
+        # reduction tile per CTA. Leave room for barriers and alignment.
+        shared_bytes = (bm + bn) * bk * 2 * config.num_stages
+        if split > 1:
+            shared_bytes += bm * bn * 4
+        if shared_bytes > 220 * 1024:
+            continue
+        if trans_dot is not None and (bn if trans_dot else bm) < 64:
+            continue
+        # The batched TMA loop has no K tail mask.
+        if "SPLIT" in args and args["K"] % (bk * split):
+            continue
+        pruned.append(config)
+    return pruned
+
+
+def _set_packed_tma_blocks(a, b, nt, meta):
+    bm, bn, bk = _packed_gemm_tile(meta)
+    a.block_shape = [bm, bk]
+    b.block_shape = [bn, bk] if nt else [bk, bn]
+
+
+def _set_batched_mm_tma_blocks(meta):
+    _set_packed_tma_blocks(meta["ad"], meta["bd"], meta["NT"], meta)
+
+
+def _batched_mm_tma_grid(meta):
+    bm, bn, _ = _packed_gemm_tile(meta)
+    tiles = triton.cdiv(meta["M"], bm) * triton.cdiv(meta["N"], bn)
+    batch = meta["B"]
+    if meta["SPLIT"] > 1 and not meta["NT"] and batch >= 4:
+        return (tiles * batch, 1, 1)
+    return (tiles, 1, batch)
+
+
+_BATCH_TMA_TUNING = dict(
+    configs=runtime.get_tuned_config("hopper_batch_tma"),
+    key=OP_KEY_ORDERS["hopper_batch_tma"],
+    prune_configs_by={"early_config_prune": _prune_packed_gemm_configs},
+    use_cuda_graph=True,
+    rep=10,
+    disable_aabs=True,
+    policy="flagtune",
+    flagtune_expand_op_name="hopper_batch_tma",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+    flagtune_pre_hook=_set_batched_mm_tma_blocks,
+)
+
+
+@libentry(cache_binding=True)
+@libtuner(flagtune_op_name="mm", **_BATCH_TMA_TUNING)
+@triton.jit
+def _batched_mm_tma(
+    ad,
+    bd,
+    out,
+    bias,
+    alpha,
+    beta,
+    CB: tl.constexpr,
+    CM: tl.constexpr,
+    CN: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    READ_BIAS: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    B: tl.constexpr,
+    PLAN_BM: tl.constexpr,
+    PLAN_BN: tl.constexpr,
+    PLAN_BK: tl.constexpr,
+    SPLIT: tl.constexpr,
+    NT: tl.constexpr,
+    TRAN: tl.constexpr,
+    MESH: tl.constexpr,
+    PLAN_STAGES: tl.constexpr,
+    PLAN_WARPS: tl.constexpr,
+    BLOCK_M: tl.constexpr = 0,
+    BLOCK_N: tl.constexpr = 0,
+    BLOCK_K: tl.constexpr = 0,
+):
+    BM: tl.constexpr = BLOCK_M or PLAN_BM
+    BN: tl.constexpr = BLOCK_N or PLAN_BN
+    BK: tl.constexpr = BLOCK_K or PLAN_BK
+    tile = tl.program_id(0) // SPLIT
+    if SPLIT > 1 and not NT and B >= 4:
+        # Adjacent clusters cover the same output tile in different batches.
+        z = tile % B
+        tile = tile // B
+    else:
+        z = tl.program_id(2)
+    if SPLIT > 1:
+        s = tle.shard_id(MESH, "cluster_x")
+    else:
+        s = 0
+    tiles_n = tl.cdiv(N, BN)
+    if SPLIT == 1 and M >= 256 and N >= 512:
+        # Visit nearby row tiles together so they reuse the same B tile in L2.
+        tiles_per_group = 8 * tiles_n
+        first_m = tile // tiles_per_group * 8
+        group_m = tl.minimum(tl.cdiv(M, BM) - first_m, 8)
+        in_group = tile % tiles_per_group
+        m = (first_m + in_group % group_m) * BM
+        n = in_group // group_m * BN
+    else:
+        m = tile // tiles_n * BM
+        n = tile % tiles_n * BN
+    if TRAN:
+        acc = tl.full((BN, BM), 0, tl.float32)
+    else:
+        acc = tl.full((BM, BN), 0, tl.float32)
+    for i in range(K // BK // SPLIT):
+        if SPLIT > 1 and not NT and B >= 4:
+            k = (i * SPLIT + s) * BK
+        else:
+            k = (s * (K // BK // SPLIT) + i) * BK
+        if NT:
+            b_n, b_k = z * N + n, k
+        else:
+            b_n, b_k = n, z * K + k
+        a, bt = _load_tma_gemm_tiles(ad, bd, z * M + m, b_n, k, b_k, NT)
+        if TRAN:
+            acc = tl.dot(bt, tl.trans(a), acc)
+        else:
+            acc = tl.dot(a, tl.trans(bt), acc)
+    if TRAN:
+        v = tl.trans(acc)
+    else:
+        v = acc
+    rm = tl.broadcast_to(tl.arange(0, BM)[:, None], (BM, BN))
+    rn = tl.broadcast_to(tl.arange(0, BN)[None, :], (BM, BN))
+    if SPLIT > 1:
+        workspace = tle.gpu.alloc([BM, BN], tl.float32, layout=None, scope=tle.gpu.smem)
+        tl.store(tle.gpu.local_ptr(workspace, (rm, rn)), v)
+        tle.distributed_barrier(MESH)
+    if s == 0:
+        if SPLIT > 1:
+            for peer_id in tl.static_range(1, SPLIT):
+                peer = tle.remote(workspace, peer_id, scope=MESH)
+                v += tl.load(tle.gpu.local_ptr(peer, (rm, rn)))
+        rows, cols = m + rm, n + rn
+        if B * M * N >= 2**31:
+            offsets = z.to(tl.int64) * M * N + rows.to(tl.int64) * N + cols
+        else:
+            offsets = z * M * N + rows * N + cols
+        if B * CB + M * CM + N * CN >= 2**31:
+            bias_offsets = (
+                z.to(tl.int64) * CB + rows.to(tl.int64) * CM + cols.to(tl.int64) * CN
+            )
+        else:
+            bias_offsets = z * CB + rows * CM + cols * CN
+        mask = True
+        if M % BM:
+            mask = mask & (rows < M)
+        if N % BN:
+            mask = mask & (cols < N)
+        _store_batched_mm_result(
+            v,
+            bias,
+            out,
+            offsets,
+            mask,
+            bias_offsets,
+            alpha,
+            beta,
+            HAS_BIAS,
+            READ_BIAS,
+        )
+    if SPLIT > 1:
+        # Keep all peer CTAs resident until rank zero has read their partials.
+        tle.distributed_barrier(MESH)
+
+
+def _set_packed_mm_tma_blocks(meta):
+    _set_packed_tma_blocks(meta["A"], meta["B"], meta["TRANS_B"], meta)
+
+
+def _packed_mm_tma_grid(meta):
+    bm, bn, _ = _packed_gemm_tile(meta)
+    return (triton.cdiv(meta["M"], bm) * triton.cdiv(meta["N"], bn),)
+
+
+_PACKED_TMA_TUNING = dict(
+    configs=runtime.get_tuned_config("hopper_addmm_tma"),
+    key=OP_KEY_ORDERS["hopper_addmm_tma"],
+    prune_configs_by={"early_config_prune": _prune_packed_gemm_configs},
+    use_cuda_graph=True,
+    rep=10,
+    disable_aabs=True,
+    policy="flagtune",
+    flagtune_expand_op_name="hopper_addmm_tma",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+    flagtune_pre_hook=_set_packed_mm_tma_blocks,
+)
+
+
+@libentry(cache_binding=True)
+@libtuner(flagtune_op_name="mm", **_PACKED_TMA_TUNING)
+@triton.jit
+def _packed_mm_tma(
+    A,
+    B,
+    Bias,
+    Out,
+    alpha,
+    beta,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    SI0: tl.constexpr,
+    SI1: tl.constexpr,
+    SO0: tl.constexpr,
+    SO1: tl.constexpr,
+    PLAN_BM: tl.constexpr,
+    PLAN_BN: tl.constexpr,
+    PLAN_BK: tl.constexpr,
+    TRANS_B: tl.constexpr,
+    ALPHA_ONE: tl.constexpr,
+    BETA: tl.constexpr,
+    PLAN_STAGES: tl.constexpr,
+    PLAN_WARPS: tl.constexpr,
+    TRANS_DOT: tl.constexpr = False,
+    BLOCK_M: tl.constexpr = 0,
+    BLOCK_N: tl.constexpr = 0,
+    BLOCK_K: tl.constexpr = 0,
+):
+    BM: tl.constexpr = BLOCK_M or PLAN_BM
+    BN: tl.constexpr = BLOCK_N or PLAN_BN
+    BK: tl.constexpr = BLOCK_K or PLAN_BK
+    pid = tl.program_id(0)
+    # Group adjacent row tiles to reuse the same B tile from L2.
+    num_m = tl.cdiv(M, BM)
+    num_n = tl.cdiv(N, BN)
+    group = pid // (8 * num_n)
+    first_m = group * 8
+    group_m = tl.minimum(num_m - first_m, 8)
+    in_group = pid % (8 * num_n)
+    m = (first_m + in_group % group_m) * BM
+    n = (in_group // group_m) * BN
+    if TRANS_DOT:
+        acc = tl.full((BN, BM), 0, tl.float32)
+    else:
+        acc = tl.full((BM, BN), 0, tl.float32)
+    for i in range(tl.cdiv(K, BK)):
+        a, b_t = _load_tma_gemm_tiles(A, B, m, n, i * BK, i * BK, TRANS_B)
+        if TRANS_DOT:
+            acc = tl.dot(b_t, tl.trans(a), acc)
+        else:
+            acc = tl.dot(a, tl.trans(b_t), acc)
+    if TRANS_DOT:
+        acc = tl.trans(acc)
+    rows = (m + tl.arange(0, BM)).to(tl.int64)
+    cols = (n + tl.arange(0, BN)).to(tl.int64)
+    valid = (rows[:, None] < M) & (cols[None, :] < N)
+    if BETA != 0:
+        bias = tl.load(Bias + rows[:, None] * SI0 + cols[None, :] * SI1, valid, 0).to(
+            tl.float32
+        )
+    else:
+        bias = 0.0
+    tl.store(
+        Out + rows[:, None] * SO0 + cols[None, :] * SO1,
+        _addmm_epilogue(acc, bias, alpha, beta, ALPHA_ONE, BETA),
+        valid,
+    )
+
+
+def _packed_mm_splitk_grid(meta):
+    bm, bn, _ = _packed_gemm_tile(meta)
+    return (triton.cdiv(meta["M"], bm), triton.cdiv(meta["N"], bn), meta["SPLITS"])
+
+
+_PACKED_SPLITK_TUNING = dict(
+    configs=runtime.get_tuned_config("hopper_addmm_splitk"),
+    key=OP_KEY_ORDERS["hopper_addmm_splitk"],
+    prune_configs_by={"early_config_prune": _prune_packed_gemm_configs},
+    use_cuda_graph=True,
+    rep=10,
+    disable_aabs=True,
+    policy="flagtune",
+    flagtune_expand_op_name="hopper_addmm_splitk",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+)
+
+
+@libentry(cache_binding=True)
+@libtuner(flagtune_op_name="mm", **_PACKED_SPLITK_TUNING)
+@triton.jit
+def _packed_mm_splitk_partials(
+    A,
+    B,
+    Partials,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_cs,
+    SPLITS: tl.constexpr,
+    PLAN_BM: tl.constexpr,
+    PLAN_BN: tl.constexpr,
+    PLAN_BK: tl.constexpr,
+    PLAN_STAGES: tl.constexpr,
+    PLAN_WARPS: tl.constexpr,
+    BLOCK_M: tl.constexpr = 0,
+    BLOCK_N: tl.constexpr = 0,
+    BLOCK_K: tl.constexpr = 0,
+):
+    BM: tl.constexpr = BLOCK_M or PLAN_BM
+    BN: tl.constexpr = BLOCK_N or PLAN_BN
+    BK: tl.constexpr = BLOCK_K or PLAN_BK
+    # Each CTA handles consecutive K tiles. FP32 partials retain the full
+    # accumulator precision until the bias and scaling are applied.
+    rows = tl.program_id(0) * BM + tl.arange(0, BM)
+    cols = tl.program_id(1) * BN + tl.arange(0, BN)
+    split = tl.program_id(2)
+    tiles = tl.cdiv(K, SPLITS * BK)
+    start = split * tiles * BK + tl.arange(0, BK)
+    acc = tl.full((BM, BN), 0, tl.float32)
+    for i in range(tiles):
+        kk = start + i * BK
+        a, b = _load_splitk_gemm_tiles(
+            A, B, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, rows, cols, kk
+        )
+        acc = tl.dot(a, b, acc)
+    tl.store(
+        Partials
+        + split * stride_cs
+        + rows[:, None] * stride_cm
+        + cols[None, :] * stride_cn,
+        acc,
+        (rows[:, None] < M) & (cols[None, :] < N),
+    )
+
+
+def _gemm_tuner_for(kernel, op, tuning):
+    # Each public operator selects its own Default/Expanded mode and entry cache.
+    return libentry(cache_binding=True)(
+        libtuner(flagtune_op_name=op, **tuning)(kernel.jit_function)
+    )
+
+
+_addmm_tma = _gemm_tuner_for(_packed_mm_tma, "addmm", _PACKED_TMA_TUNING)
+_addmm_splitk = _gemm_tuner_for(
+    _packed_mm_splitk_partials, "addmm", _PACKED_SPLITK_TUNING
+)
+_addmm_batch_tma = _gemm_tuner_for(_batched_mm_tma, "addmm", _BATCH_TMA_TUNING)
+_bmm_tma = _gemm_tuner_for(_batched_mm_tma, "bmm", _BATCH_TMA_TUNING)
+_baddbmm_tma = _gemm_tuner_for(_batched_mm_tma, "baddbmm", _BATCH_TMA_TUNING)
+
+
+def _h20_packed_mm(a, b, c, m, n, k, nt):
+    if 1024 <= n <= 8192 and m <= 1024 and k <= 512 and (k <= 128 or nt or m <= 192):
+        # Short reductions benefit from more output tiles and a shallow pipeline.
+        bm = 16 if m <= 128 else 32
+        bk = 128 if k >= 512 and m <= 32 else 64
+        _packed_mm_direct(a, b, c, m, n, k, nt, bm, 64, bk, 3, 4, True)
+        return True
+    if (
+        256 <= m <= 768
+        and 256 <= n <= 768
+        and 256 <= k <= 768
+        and triton.cdiv(m, 32) * triton.cdiv(n, 64) >= _H20_SM_COUNT
+    ):
+        _packed_mm_direct(a, b, c, m, n, k, nt, 32, 64, 128, 3, 4, True)
+        return True
+    if (
+        1024 <= n <= 4096
+        and 512 < k <= 4096
+        and (m <= 32 or (k <= 2048 and (m <= 128 if nt else m <= 64)))
+    ):
+        tiles = triton.cdiv(m, 16) * triton.cdiv(n, 64)
+        bk = 256 if tiles <= _H20_SM_COUNT else (128 if tiles <= 160 else 64)
+        _packed_mm_direct(a, b, c, m, n, k, nt, 16, 64, bk, 3, 4, True)
+        return True
+    if 32 < m <= 256 and 1024 <= n <= 3072 and 3072 <= k <= 4096:
+        # Keep narrow output tiles for deep projections that would otherwise
+        # use the general GEMM, and increase the K tile for underfilled grids.
+        bm = 32 if n <= 1536 or m > 128 else 16
+        tiles = triton.cdiv(m, bm) * triton.cdiv(n, 64)
+        bk = 256 if m <= 128 and tiles <= _H20_SM_COUNT else 128
+        _packed_mm_direct(a, b, c, m, n, k, nt, bm, 64, bk, 3, 4, True)
+        return True
+    if nt and 128 < m <= 256 and 3072 <= n <= 6144 and 512 < k <= 1536:
+        _packed_mm_direct(a, b, c, m, n, k, nt, 16, 128, 128, 3, 4, True)
+        return True
+    if m <= 16 and 4096 < n <= _H20_SM_COUNT * 64 and 3072 <= k <= 4096:
+        _packed_mm_direct(a, b, c, m, n, k, nt, 16, 64, 256, 3, 4, True)
+        return True
+    if not (16 <= n <= 512 and 2048 <= k <= 8192 and k % 256 == 0) or (
+        n > 128 and k > 4096 and m > 256
+    ):
+        return False
+
+    # Map the 64-row WGMMA dimension to the columns for narrow outputs.
+    # Keep the K reduction in a cluster while the output grid underfills H20.
+    if n <= 32 and m <= 4096:
+        bm = 16 if m <= 256 else (32 if m <= 1024 else 64)
+        bn, transpose = triton.next_power_of_2(n), False
+    elif n <= 128 and m <= 1536:
+        bm, bn, transpose = (16 if m <= 768 else 32), 64, True
+    elif n <= 128 and m <= 3072:
+        bm, bn, transpose = 64, 64, False
+    elif m <= 512:
+        bm, bn, transpose = (16 if m <= 128 else 32), 64, True
+    elif m <= 2048:
+        bm, bn, transpose = 64, 64, False
+    else:
+        return False
+
+    tiles = triton.cdiv(m, bm) * triton.cdiv(n, bn)
+    if tiles <= 48 and not (n > 128 and k <= 2048 and not nt and tiles >= 32):
+        splits = 4 if tiles <= 24 else 2
+        bk = 256 if bm + bn <= 96 and k % (256 * splits) == 0 else 128
+        use_partials = k > 4096 and 16 < tiles and n >= 256 and (nt or n >= 512)
+        if not use_partials and splits in _CLUSTER_MESH and k % (bk * splits) == 0:
+            _packed_mm_cluster(a, b, c, m, n, k, nt, bm, bn, bk, splits, transpose)
+        else:
+            splits = min(
+                32, triton.next_power_of_2(triton.cdiv(2 * _H20_SM_COUNT, tiles))
+            )
+            _packed_mm_split(a, b, c, m, n, k, nt, True, bm, bn, splits)
+        return True
+    bk = 128 if m > 512 and (n > 32 or tiles > _H20_SM_COUNT) else 256
+    _packed_mm_direct(a, b, c, m, n, k, nt, bm, bn, bk, 3, 4, transpose)
+    return True
+
+
+def _h20_fp16_thin_mm(a, b, c, m, n, k, nt):
+    # Pointer loads handle narrow rows without TMA padding or input copies.
+    # Splitting K gives short matrices enough CTAs and preserves FP32 partials.
+    if m <= 384:
+        bm, bk = 32, 256
+        splits = 32 if m <= 128 else 16
+    else:
+        bm, bk = (32 if 768 < m <= 1536 else 64), 128
+        splits = 16 if m <= 4096 else (8 if m <= 8192 else 4)
+    _packed_mm_split(
+        a,
+        b,
+        c,
+        m,
+        n,
+        k,
+        nt,
+        False,
+        bm,
+        16,
+        splits,
+        block_k=bk,
+        reduce_block=32 if m * n <= 128 else 256,
+    )
+
+
+def _packed_mm(a, b, c, m, n, k):
+    # Keep the explicit autotuning entry points on their existing policies.
     if (
         (os.getenv("USE_FLAGTUNE") != "0" and runtime.flagtune_enabled("mm"))
-        or _PackedTensorDescriptor is None
+        or TensorDescriptor is None
         or m < 1
         or n < 2
         or k < 64
-        or (4 < m <= 16 and n >= 4096 and not thin_wide)
-        or (4 < m <= 128 and n >= 32768)
-        or (
-            m > 512
-            and ((n <= 512 and not (tall_narrow or tall_skinny)) or n % 8 or k < 128)
-        )
         or a.dtype not in (torch.float16, torch.bfloat16)
         or a.dtype != b.dtype
         or a.dtype != c.dtype
@@ -2837,7 +3442,9 @@ def _packed_mm(a, b, c, m, n, k):
         and a.data_ptr() % 16 == 0
         and b.data_ptr() % 16 == 0
     )
-    if not tma and (m > 512 or n > 512 or k < 512):
+    use_pointers = m <= 512 and n <= 512 and k >= 512
+    h20_fp16_thin = a.dtype == torch.float16 and n <= 4 and k == 16384 and m <= 16384
+    if not (tma or use_pointers or h20_fp16_thin):
         return False
 
     if a.device.index != torch_device_fn.current_device():
@@ -2846,6 +3453,50 @@ def _packed_mm(a, b, c, m, n, k):
 
     sm_count = get_sm_count()
     if sm_count <= _H20_SM_COUNT:
+        if sm_count == _H20_SM_COUNT:
+            if h20_fp16_thin:
+                _h20_fp16_thin_mm(a, b, c, m, n, k, nt)
+                return True
+            if tma:
+                return _h20_packed_mm(a, b, c, m, n, k, nt)
+            if (
+                m <= 128
+                and 64 <= n <= 512
+                and 1024 <= k <= 4096
+                and (k % 8 or (not nt and n % 8))
+            ):
+                # Fill a wave with masked K partitions when the packed strides
+                # cannot be used with a tensor descriptor.
+                tiles = triton.cdiv(m, 32) * triton.cdiv(n, 32)
+                splits = min(
+                    8, max(2, triton.next_power_of_2(triton.cdiv(_H20_SM_COUNT, tiles)))
+                )
+                _packed_mm_split(
+                    a, b, c, m, n, k, nt, False, 32, 32, splits, block_k=128
+                )
+                return True
+        return False
+    if not (tma or use_pointers):
+        return False
+
+    # Small and medium output grids need more CTAs than the legacy GEMM tile.
+    thin_wide = n >= 4096 and (m <= 4 or (m <= 16 and k <= 1024 and n < 32768))
+    tall_skinny = m >= 1024 and n == 16 and k in (2048, 4096)
+    tall_narrow = (
+        1024 <= m <= 8192
+        and 32 <= n <= 512
+        and (n <= 256 or m < 2048)
+        and k >= 1024
+        and k % 256 == 0
+    )
+    if (
+        (4 < m <= 16 and n >= 4096 and not thin_wide)
+        or (4 < m <= 128 and n >= 32768)
+        or (
+            m > 512
+            and ((n <= 512 and not (tall_narrow or tall_skinny)) or n % 8 or k < 128)
+        )
+    ):
         return False
     if (
         tma
@@ -2946,8 +3597,13 @@ def _packed_mm(a, b, c, m, n, k):
 
     if not tma:
         return False
+    _packed_mm_direct(a, b, c, m, n, k, nt, bm, bn, bk, stages, warps, trans_dot)
+    return True
+
+
+def _packed_mm_direct(a, b, c, m, n, k, nt, bm, bn, bk, stages, warps, trans_dot):
     ad, bd = _packed_mm_descriptors(a, b, m, n, k, nt, bm, bn, bk)
-    _addmm_tma[(triton.cdiv(m, bm) * triton.cdiv(n, bn),)](
+    _packed_mm_tma[_packed_mm_tma_grid](
         ad,
         bd,
         c,
@@ -2968,16 +3624,14 @@ def _packed_mm(a, b, c, m, n, k):
         True,
         0,
         TRANS_DOT=trans_dot,
-        num_stages=stages,
-        num_warps=warps,
+        PLAN_STAGES=stages,
+        PLAN_WARPS=warps,
     )
-    return True
 
 
 def _packed_mm_cluster(a, b, c, m, n, k, nt, bm, bn, bk, splits, trans_dot=True):
     ad, bd = _packed_mm_descriptors(a, b, m, n, k, nt, bm, bn, bk)
-    tiles = triton.cdiv(m, bm) * triton.cdiv(n, bn)
-    _batch_tma[(tiles, 1, 1)](
+    _batched_mm_tma[_batched_mm_tma_grid](
         ad,
         bd,
         c,
@@ -3000,26 +3654,28 @@ def _packed_mm_cluster(a, b, c, m, n, k, nt, bm, bn, bk, splits, trans_dot=True)
         nt,
         trans_dot,
         _CLUSTER_MESH.get(splits),
-        num_stages=4,
-        num_warps=4,
+        PLAN_STAGES=4,
+        PLAN_WARPS=4,
     )
 
 
 def _packed_mm_descriptors(a, b, m, n, k, nt, bm, bn, bk):
-    ad = _PackedTensorDescriptor(a, (m, k), (k, 1), [bm, bk])
+    ad = TensorDescriptor(a, (m, k), (k, 1), [bm, bk])
     if nt:
-        bd = _PackedTensorDescriptor(b, (n, k), (k, 1), [bn, bk])
+        bd = TensorDescriptor(b, (n, k), (k, 1), [bn, bk])
     else:
-        bd = _PackedTensorDescriptor(b, (k, n), (n, 1), [bk, bn])
+        bd = TensorDescriptor(b, (k, n), (n, 1), [bk, bn])
     return ad, bd
 
 
-def _packed_mm_split(a, b, c, m, n, k, nt, tma, bm, bn, splits):
+def _packed_mm_split(
+    a, b, c, m, n, k, nt, tma, bm, bn, splits, *, block_k=None, reduce_block=256
+):
     if n <= 32:
         # A small MMA tile avoids padding a narrow tail to a full WGMMA tile.
         tma = False
         bn = 16 if n <= 16 else 32
-    bk = 128 if tma else 64
+    bk = block_k if block_k is not None else (128 if tma else 64)
     splits = min(splits, triton.next_power_of_2(triton.cdiv(k, bk)))
     partials = torch.empty((splits, m, n), dtype=torch.float32, device=a.device)
     tm, tn = triton.cdiv(m, bm), triton.cdiv(n, bn)
@@ -3044,29 +3700,33 @@ def _packed_mm_split(a, b, c, m, n, k, nt, tma, bm, bn, splits):
             num_warps=4,
         )
     else:
-        _addmm_splitk[(tm, tn, splits)](
+        _packed_mm_splitk_partials[_packed_mm_splitk_grid](
             a,
             b,
             partials,
             m,
             n,
             k,
+            *a.stride(),
             *b.stride(),
+            partials.stride(1),
+            partials.stride(2),
+            partials.stride(0),
             splits,
             bm,
             bn,
             bk,
-            num_stages=3,
-            num_warps=4,
+            PLAN_STAGES=3,
+            PLAN_WARPS=4,
         )
-    mm_kernel_tma_splitk_reduce[(triton.cdiv(m * n, 256),)](
+    mm_kernel_tma_splitk_reduce[(triton.cdiv(m * n, reduce_block),)](
         partials,
         c,
         m * n,
         m * n,
         splits,
-        256,
-        num_warps=4,
+        reduce_block,
+        num_warps=1 if reduce_block == 32 else 4,
     )
 
 
