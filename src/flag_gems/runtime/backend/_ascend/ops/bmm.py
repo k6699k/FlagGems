@@ -15,6 +15,7 @@
 import logging
 import os
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -90,7 +91,21 @@ def vector_tile_fits_910b(rows, reduction, element_bytes, stages):
     return matrix_bytes + vector_bytes <= _UB_BYTES
 
 
+def _bench_ascend_graph(kernel_call, quantiles, *, rep):
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+    torch.npu.current_stream().synchronize()
+    return triton.testing.do_bench_cudagraph(kernel_call, rep=rep, quantiles=quantiles)
+
+
 class AscendBlasTuner(LibTuner.get("flagtune")):
+    def __init__(self, *args, use_cuda_graph=False, do_bench=None, rep=100, **kwargs):
+        if use_cuda_graph and do_bench is None:
+            do_bench = partial(_bench_ascend_graph, rep=100 if rep is None else rep)
+        super().__init__(
+            *args, use_cuda_graph=use_cuda_graph, do_bench=do_bench, rep=rep, **kwargs
+        )
+
     def get_key(self, args):
         key = super().get_key(args)
         if is_ascend_910b():

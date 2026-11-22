@@ -14,7 +14,7 @@
 
 import logging
 import math
-from functools import lru_cache
+from functools import lru_cache, partial
 from numbers import Number
 from pathlib import Path
 
@@ -28,6 +28,8 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils.libentry import LibTuner
 from flag_gems.utils.shape_utils import volume
+
+from .bmm import _bench_ascend_graph
 
 logger = logging.getLogger(__name__)
 
@@ -279,7 +281,7 @@ def mul_contiguous_chunked_kernel(
     strategy=["align32", "default"],
     warmup=5,
     rep=5,
-    use_cuda_graph=True,
+    do_bench=partial(_bench_ascend_graph, rep=5),
     flagtune_op_name="mul",
     flagtune_expand_op_name="mul",
     flagtune_yaml_path=_MUL_EXPAND_PATH,
@@ -858,7 +860,7 @@ class _MulTiledTuner(LibTuner.get("flagtune")):
     warmup=5,
     rep=5,
     policy=_MulTiledTuner,
-    use_cuda_graph=True,
+    do_bench=partial(_bench_ascend_graph, rep=5),
     flagtune_op_name="mul",
     flagtune_expand_op_name="mul_broadcast_tiled",
     flagtune_yaml_path=_MUL_EXPAND_PATH,
