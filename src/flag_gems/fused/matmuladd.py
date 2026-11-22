@@ -27,25 +27,18 @@ from flag_gems.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-_addmm_expand = (
-    runtime.get_expand_config("addmm")
-    if os.environ.get("USE_FLAGTUNE") == "1"
-    else None
-)
-_use_addmm_expand = isinstance(_addmm_expand, dict)
-
 
 @libentry()
 @libtuner(
     configs=(
         runtime.ops_get_configs("addmm", pre_hook=None)
-        if _use_addmm_expand
+        if os.environ.get("USE_FLAGTUNE") == "1"
         else runtime.get_tuned_config("addmm")
     ),
     key=["M", "N", "K"],
     strategy=(
-        _addmm_expand["strategy"]
-        if _use_addmm_expand
+        runtime.get_expand_config("addmm")["strategy"]
+        if os.environ.get("USE_FLAGTUNE") == "1"
         else ["align32", "align32", "align32"]
     ),
     warmup=5,
