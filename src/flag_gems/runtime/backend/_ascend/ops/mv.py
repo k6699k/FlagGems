@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from pathlib import Path
 
 import torch
 import triton
@@ -20,42 +21,72 @@ import triton.language as tl
 
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
+from flag_gems.runtime.backend._ascend.blas_resources import (
+    is_ascend_910b,
+    vector_tile_fits_910b,
+)
+from flag_gems.runtime.backend._ascend.gemm_tuning import AscendBlasTuner
+from flag_gems.runtime.flagtune import register_flagtune_op
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as ext
+from flag_gems.utils.libentry import LibTunerRunMode
 
 logger = logging.getLogger(__name__)
+_MV_EXPAND_PATH = str(Path(__file__).resolve().parent.parent / "mv_ascend_expand.yaml")
+_MV_MAX_GRID = 65535
+# BLOCK_M=128, BLOCK_N=16 fits 910B UB even with a strided reduction.
+_MV_910B_MAX_ROWS = 16 * _MV_MAX_GRID
+register_flagtune_op(
+    "mv_column", description="matrix-vector multiplication over a column-major matrix"
+)
 
 
 def _prune_mv_configs(configs, named_args, **kwargs):
-    """Keep the Ascend GEMV search space focused on useful row tiles."""
+    """Bound the legacy GEMV launch grid and FP32 accumulation tile."""
     args = {**named_args, **kwargs}
-    try:
-        n = int(args["N"])
-        m = int(args["M"])
-    except (KeyError, TypeError, ValueError):
-        return configs
-    # Larger row tiles reduce the number of Ascend programs for contiguous
-    # model GEMVs; retain the generic candidates for small or unusual inputs.
-    if m not in (2048, 4096) or n < 128:
-        return configs
-    selected = [
-        c
-        for c in configs
-        if c.kwargs.get("BLOCK_M", 0) in (128, 256, 512, 1024, 2048, 4096)
-        and c.kwargs.get("BLOCK_N", 0) in (1, 2, 4, 8, 16, 32)
-    ]
-    return selected or configs
+    strided_reduction = args["stride_am"] > 1
+    dtype = args["A"].dtype
+    is_910b = is_ascend_910b()
+    low_precision = dtype in (torch.float16, torch.bfloat16)
+    # The legacy kernel accumulates a full FP32 tile. Strided loads
+    # along K leave less UB available than contiguous reductions.
+    tile_limit = 4096 if strided_reduction else 32768
+    valid = []
+    for config in configs:
+        block_m, block_n = (config.kwargs[key] for key in ("BLOCK_M", "BLOCK_N"))
+        if triton.cdiv(args["N"], block_n) > _MV_MAX_GRID:
+            continue
+        if is_910b:
+            if vector_tile_fits_910b(
+                block_n,
+                block_m,
+                dtype.itemsize,
+                config.num_stages,
+                strided=strided_reduction,
+            ):
+                valid.append(config)
+            continue
+        rows = max(block_n, 2) if strided_reduction else block_n
+        if not low_precision or block_m * rows < tile_limit:
+            valid.append(config)
+    return valid
 
 
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("mv"),
-    key=["M", "N"],
-    strategy=["align32", "align32"],
+    key=["M", "N", "stride_an", "stride_am", "stride_bm", "stride_cn"],
+    strategy=["align32", "align32", "default", "default", "default", "default"],
     prune_configs_by={"early_config_prune": _prune_mv_configs},
     warmup=5,
-    rep=10,
+    rep=20,
+    use_cuda_graph=True,
     flagtune_op_name="mv",
+    flagtune_expand_op_name="mv_ascend",
+    flagtune_yaml_path=_MV_EXPAND_PATH,
+    flagtune_op_id="flaggems/mv",
+    flagtune_variant="gemv",
+    policy=AscendBlasTuner,
 )
 @triton.jit
 def mv_kernel(
@@ -91,22 +122,231 @@ def mv_kernel(
     tl.store(C_ptrs, acc[:, None], mask=n_mask)
 
 
+@triton.jit
+def _mv_column_tiles(
+    A,
+    X,
+    Y,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    STRIDE_K: tl.constexpr,
+    STRIDE_X: tl.constexpr,
+    PADDED_N: tl.constexpr,
+    SPLIT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    CHUNK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_tiles = tl.cdiv(N, BLOCK_N)
+    rows = (pid % row_tiles) * BLOCK_N + tl.arange(0, BLOCK_N)
+    part = pid // row_tiles
+    offsets = tl.arange(0, BLOCK_K)
+    acc = tl.zeros((BLOCK_K, BLOCK_N), tl.float32)
+    chunk = CHUNK_K if SPLIT else K
+    # Adjacent output rows are adjacent in memory for column-major inputs.
+    for tile in range(tl.cdiv(chunk, BLOCK_K)):
+        ks = part * chunk + tile * BLOCK_K + offsets
+        a = tl.load(
+            A + ks[:, None] * STRIDE_K + rows[None, :],
+            (ks < K)[:, None] & (rows < N)[None, :],
+            other=0,
+        ).to(tl.float32)
+        x = tl.load(X + ks * STRIDE_X, ks < K, other=0).to(tl.float32)
+        acc += a * x[:, None]
+    values = tl.sum(acc, axis=0)
+    if SPLIT:
+        tl.store(Y + part * PADDED_N + rows, values)
+    else:
+        tl.store(Y + rows, values, rows < N)
+
+
+@triton.jit
+def _mv_merge_column_tiles(
+    Partial,
+    Out,
+    N: tl.constexpr,
+    PADDED_N: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BLOCK_SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    parts = tl.arange(0, BLOCK_SPLITS)
+    partial = tl.load(
+        Partial + parts[:, None] * PADDED_N + rows[None, :],
+        (parts < SPLITS)[:, None] & (rows < N)[None, :],
+        other=0,
+    )
+    tl.store(Out + rows, tl.sum(partial, axis=0), rows < N)
+
+
+_COLUMN_MIN_CHUNK = 128
+_COLUMN_MAX_BLOCK_N = 256
+
+
+def _prune_column_mv_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    n, k, split = (args[name] for name in ("N", "K", "SPLIT"))
+    is_910b = is_ascend_910b()
+    candidates = []
+    for config in configs:
+        block_n, block_k, chunk = (
+            config.kwargs[name] for name in ("BLOCK_N", "BLOCK_K", "CHUNK_K")
+        )
+        if block_n > _COLUMN_MAX_BLOCK_N or bool(chunk) != bool(split):
+            continue
+        if split and (chunk < _COLUMN_MIN_CHUNK or chunk % block_k):
+            continue
+        if is_910b:
+            if not vector_tile_fits_910b(
+                block_n, block_k, args["A"].dtype.itemsize, config.num_stages
+            ):
+                continue
+        elif block_n * block_k > (8192 if config.num_stages > 1 else 16384):
+            continue
+        splits = triton.cdiv(k, chunk) if split else 1
+        if triton.cdiv(n, block_n) * splits <= 65535:
+            candidates.append(config)
+    return candidates
+
+
+mv_column_kernel = libentry()(
+    libtuner(
+        configs=[
+            triton.Config(
+                {"BLOCK_N": block_n, "BLOCK_K": 128, "CHUNK_K": chunk},
+                num_warps=4,
+                num_stages=1,
+            )
+            for block_n, chunk in ((64, _COLUMN_MIN_CHUNK), (128, 0))
+        ],
+        key=["N", "K", "STRIDE_K", "STRIDE_X", "SPLIT"],
+        prune_configs_by={"early_config_prune": _prune_column_mv_configs},
+        warmup=5,
+        rep=20,
+        use_cuda_graph=True,
+        disable_aabs=True,
+        flagtune_op_name="mv_column",
+        flagtune_expand_op_name="mv_column_ascend",
+        flagtune_yaml_path=_MV_EXPAND_PATH,
+        flagtune_op_id="flaggems/mv",
+        flagtune_variant="column_gemv",
+        flagtune_dtype_resolver=lambda args: (
+            args["A"].dtype,
+            args["X"].dtype,
+            args["A"].dtype,
+        ),
+        policy=AscendBlasTuner,
+    )(_mv_column_tiles)
+)
+
+
+def _can_launch_column_mv(inp, vec):
+    n, k = inp.shape
+    splits = triton.cdiv(k, _COLUMN_MIN_CHUNK) if n < 4096 else 1
+    return (
+        n > 1
+        and k >= 1024
+        and inp.stride(0) == 1
+        and inp.stride(1) == n
+        and inp.dtype == vec.dtype
+        and inp.dtype in (torch.float16, torch.bfloat16)
+        and splits <= 128
+        and triton.cdiv(n, 64 if splits > 1 else 128) * splits <= 65535
+        and n * k <= 2**31
+        and (k - 1) * vec.stride(0) < 2**31
+    )
+
+
+def _launch_column_mv(inp, vec, out, n, k):
+    split = int(n < 4096)
+    chunk = _COLUMN_MIN_CHUNK if split else 0
+    block_n = 64 if split else 128
+    splits = triton.cdiv(k, chunk) if split else 1
+    tune = (
+        mv_column_kernel.fn._run_mode is not LibTunerRunMode.NORMAL
+        or runtime.flagtune_enabled("mv_column")
+    )
+    # Reserve a row pitch large enough for every candidate's padded output tile.
+    row_alignment = _COLUMN_MAX_BLOCK_N if tune else block_n
+    padded_n = triton.cdiv(n, row_alignment) * row_alignment
+    partial = out
+    if split:
+        partial = torch.empty(
+            (splits, padded_n), device=out.device, dtype=torch.float32
+        )
+    args = (
+        inp,
+        vec,
+        partial,
+        n,
+        k,
+        inp.stride(1),
+        vec.stride(0),
+        padded_n,
+        split,
+    )
+    if tune:
+
+        def grid(meta):
+            parts = triton.cdiv(k, meta["CHUNK_K"]) if split else 1
+            return (triton.cdiv(n, meta["BLOCK_N"]) * parts,)
+
+        _, selected = mv_column_kernel[grid](*args)
+        if split:
+            splits = triton.cdiv(k, selected["CHUNK_K"])
+    else:
+        _mv_column_tiles[(triton.cdiv(n, block_n) * splits,)](
+            *args, block_n, 128, chunk, num_warps=4, num_stages=1
+        )
+    if split:
+        _mv_merge_column_tiles[(triton.cdiv(n, 64),)](
+            partial,
+            out,
+            n,
+            partial.shape[1],
+            splits,
+            triton.next_power_of_2(splits),
+            64,
+            num_warps=4,
+            num_stages=1,
+        )
+
+
 def mv(inp, vec):
     logger.debug("GEMS_ASCEND MV")
     assert inp.shape[1] == vec.shape[0], "incompatible dimensions"
     N, M = inp.shape
+    if M == 0:
+        return torch.zeros((N,), device=inp.device, dtype=inp.dtype)
     out = torch.empty((N,), device=inp.device, dtype=inp.dtype)
-    grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]),)
+    if N == 0:
+        return out
     with torch_device_fn.device(inp.device):
-        mv_kernel[grid](
-            inp,
-            vec,
-            out,
-            N,
-            M,
-            inp.stride(0),
-            inp.stride(1),
-            vec.stride(0),
-            out.stride(0),
-        )
+        # Offline fixed-config collection still targets the existing GEMV tuner.
+        if mv_kernel.fn._run_mode is LibTunerRunMode.NORMAL and _can_launch_column_mv(
+            inp, vec
+        ):
+            _launch_column_mv(inp, vec, out, N, M)
+            return out
+        max_rows = _MV_910B_MAX_ROWS if is_ascend_910b() else N
+        for start in range(0, N, max_rows):
+            rows = min(N - start, max_rows)
+            matrix, result = inp, out
+            if rows < N:
+                matrix = inp[start : start + rows]
+                result = out[start : start + rows]
+            grid = lambda meta: (triton.cdiv(rows, meta["BLOCK_N"]),)
+            mv_kernel[grid](
+                matrix,
+                vec,
+                result,
+                rows,
+                M,
+                inp.stride(0),
+                inp.stride(1),
+                vec.stride(0),
+                out.stride(0),
+            )
     return out

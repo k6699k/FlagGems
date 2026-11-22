@@ -1,0 +1,31 @@
+mv_ascend:
+  - config:
+    include_default_configs: true
+    param_map:
+      META: {BLOCK_M: block_m, BLOCK_N: block_n}
+      num_stages: stages
+      num_warps: warps
+    block_m: [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+    block_n: [1, 2, 4, 8, 16, 32, 64, 128]
+    stages: [1, 2, 3]
+    warps: [4]
+  - strategy: {M: align32, N: align32, stride_an: default, stride_am: default, stride_bm: default, stride_cn: default}
+
+mv_column_ascend:
+  - config:
+    param_map: &column_params
+      META: {BLOCK_N: block_n, BLOCK_K: block_k, CHUNK_K: chunk_k}
+      num_stages: stages
+      num_warps: warps
+    block_n: [16, 32, 64, 128, 256]
+    block_k: [32, 64, 128, 256]
+    chunk_k: [0, 128, 256, 512]
+    stages: [1]
+    warps: [4]
+  - config:
+    param_map: *column_params
+    block_n: [32, 64, 128]
+    block_k: [64, 128]
+    chunk_k: [0, 256, 512]
+    stages: [2]
+    warps: [4]

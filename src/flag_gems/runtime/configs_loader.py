@@ -176,6 +176,13 @@ class TunedConfigLoader(object):
                 "mm_simt_row": ("BN", "BK"),
                 "mm_simt_column": ("BM", "BK"),
                 "bmm_vector": ("BR", "BK"),
+                "narrow_gemv_ascend": ("BM", "BK"),
+                "column_gemv_ascend": ("BM", "BK"),
+                "mv_column_ascend": ("BLOCK_N", "BLOCK_K", "CHUNK_K"),
+                "mm_narrow_gemv_ascend": ("BLOCK_OUT", "BLOCK_K"),
+                "mm_rectangular_ascend": ("BLOCK_M", "BLOCK_N", "BLOCK_K"),
+                "mm_packed_narrow_ascend": ("BM", "BK"),
+                "panel_gemm_ascend": ("BM", "BK"),
             }.get(op_name)
         if fields is not None:
             return [
@@ -186,6 +193,40 @@ class TunedConfigLoader(object):
                     pre_hook=pre_hook,
                 )
                 for values in product(*(ranges[field.upper()] for field in fields))
+                for stages in ranges["s"]
+                for warps in ranges["w"]
+            ]
+
+        if op_name == "tiled_gemm_ascend":
+            return [
+                triton.Config(
+                    dict(BM=bm, BN=bn, BK=bk),
+                    num_stages=stages,
+                    num_warps=warps,
+                    pre_hook=pre_hook,
+                )
+                for bm, bn, bk in product(ranges["BM"], ranges["BN"], ranges["BK"])
+                for stages in ranges["s"]
+                for warps in ranges["w"]
+            ]
+
+        if op_name in ("bmm_ascend", "baddbmm_ascend"):
+            return [
+                triton.Config(
+                    {
+                        "TILE_M": tile_m,
+                        "TILE_N": tile_n,
+                        "TILE_K": tile_k,
+                        "GROUP_M": group_m,
+                    },
+                    num_stages=stages,
+                    num_warps=warps,
+                    pre_hook=pre_hook,
+                )
+                for tile_m in ranges["TILE_M"]
+                for tile_n in ranges["TILE_N"]
+                for tile_k in ranges["TILE_K"]
+                for group_m in ranges["GROUP_M"]
                 for stages in ranges["s"]
                 for warps in ranges["w"]
             ]
@@ -332,7 +373,7 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name in ("mv", "mv_row", "mv_column"):
+        if op_name in ("mv", "mv_row", "mv_column", "mv_ascend"):
             return [
                 triton.Config(
                     {
@@ -892,6 +933,20 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
+        if op_name == "mul_broadcast_tiled":
+            return [
+                triton.Config(
+                    {"BLOCK_M": block_m, "BLOCK_N": block_n},
+                    num_stages=stages,
+                    num_warps=warps,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for stages in ranges["s"]
+                for warps in ranges["w"]
+            ]
+
         if op_name in (
             "mul",
             "mul_broadcast_2d",
@@ -935,7 +990,7 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name in ("mm_splitk", "mm_w8a8_fp8_splitk"):
+        if op_name in ("mm_splitk", "mm_w8a8_fp8_splitk", "addmm_ascend", "mm_ascend"):
             has_pipeline = "PIPELINE" in ranges
             pipelines = ranges.get("PIPELINE", [None])
             return [
@@ -1031,6 +1086,102 @@ class TunedConfigLoader(object):
             "addmm_vector": self._build_single_expand_spec("addmm_vector"),
             "baddbmm_gemm": self._build_single_expand_spec("baddbmm_gemm"),
             "baddbmm_vector": self._build_single_expand_spec("baddbmm_vector"),
+            **{
+                name: {
+                    "key": ["M", "K", "WITH_BIAS", "BATCH"],
+                    "default_strategy": ["default"] * 4,
+                }
+                for name in ("narrow_gemv_ascend", "column_gemv_ascend")
+            },
+            "mm_narrow_gemv_ascend": {
+                "key": ["M", "K"],
+                "default_strategy": ["default"] * 2,
+            },
+            **{
+                name: {"key": ["M", "N", "K"], "default_strategy": ["default"] * 3}
+                for name in (
+                    "mm_rectangular_ascend",
+                    "mm_packed_narrow_ascend",
+                    "panel_gemm_ascend",
+                )
+            },
+            "tiled_gemm_ascend": {
+                "yaml_op_name": "tiled_gemm_ascend",
+                "key": ["BATCH", "M", "N", "K", "TRANSPOSED", "WITH_BIAS", "HINT"],
+                "default_strategy": ["default"] * 7,
+            },
+            "bmm_ascend": {
+                "yaml_op_name": "bmm_ascend",
+                "key": ["M", "N", "K", "BATCH", "DOT_PAD_ONLY_K"],
+                "default_strategy": ["default"] * 5,
+                "default_op_name": "bmm",
+                "expand_yaml_path": self._get_expand_config_path("bmm"),
+            },
+            "mv_ascend": {
+                "yaml_op_name": "mv_ascend",
+                "key": ["M", "N", "stride_an", "stride_am", "stride_bm", "stride_cn"],
+                "default_strategy": [
+                    "align32",
+                    "align32",
+                    "default",
+                    "default",
+                    "default",
+                    "default",
+                ],
+                "default_op_name": "mv",
+                "expand_yaml_path": self._get_expand_config_path("mv"),
+            },
+            "mv_column_ascend": {
+                "key": ["N", "K", "STRIDE_K", "STRIDE_X", "SPLIT"],
+                "default_strategy": ["default"] * 5,
+                "expand_yaml_path": self._get_expand_config_path("mv"),
+            },
+            "baddbmm_ascend": {
+                "yaml_op_name": "baddbmm_ascend",
+                "key": [
+                    "M",
+                    "N",
+                    "K",
+                    "BATCH",
+                    "DOT_PAD_ONLY_K",
+                    "BIAS_IS_VECTOR",
+                    "bias_batch_stride",
+                    "bias_M_stride",
+                    "bias_N_stride",
+                ],
+                "default_strategy": ["default"] * 9,
+                "default_op_name": "baddbmm",
+                "expand_yaml_path": self._get_expand_config_path("baddbmm"),
+            },
+            "mm_ascend": {
+                "yaml_op_name": "mm_ascend",
+                "key": ["M", "N", "K"],
+                "default_strategy": ["default"] * 3,
+                "default_op_name": "mm",
+                "expand_yaml_path": self._get_expand_config_path("mm_ascend"),
+            },
+            "addmm_ascend": {
+                "yaml_op_name": "addmm_ascend",
+                "key": [
+                    "M",
+                    "N",
+                    "K",
+                    "stride_am",
+                    "stride_ak",
+                    "stride_bk",
+                    "stride_bn",
+                    "stride_im",
+                    "stride_in",
+                    "stride_cm",
+                    "stride_cn",
+                    "BIAS_IS_VECTOR",
+                    "BIAS_IS_SCALAR",
+                    "BETA_IS_ZERO",
+                    "DOT_PAD_ONLY_K",
+                ],
+                "default_strategy": ["default"] * 15,
+                "expand_yaml_path": self._get_expand_config_path("addmm"),
+            },
             "router_gemm": self._build_single_expand_spec("router_gemm"),
             **{
                 name: {
@@ -1371,6 +1522,9 @@ class TunedConfigLoader(object):
             "mul": self._build_single_expand_spec(
                 "mul", expand_yaml_path=self._get_expand_config_path("mul")
             ),
+            "mul_broadcast_tiled": self._build_single_expand_spec(
+                "mul_broadcast_tiled"
+            ),
             "mul_broadcast_2d": self._build_single_expand_spec(
                 "mul_broadcast_2d",
                 expand_yaml_path=self._get_expand_config_path("mul"),
@@ -1659,7 +1813,10 @@ class TunedConfigLoader(object):
         if not expand_config["include_default_configs"]:
             return configs
 
-        for default_config in self.get_tuned_config(op_name):
+        default_op_name = self.expand_config_registry[op_name].get(
+            "default_op_name", op_name
+        )
+        for default_config in self.get_tuned_config(default_op_name):
             key = config_key(default_config)
             if key in seen:
                 continue

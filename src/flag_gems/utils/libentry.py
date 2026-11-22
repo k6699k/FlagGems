@@ -111,6 +111,7 @@ class LibTunerRunMode(str, Enum):
     """Control one scoped :class:`LibTuner.run` config-selection pass."""
 
     NORMAL = "normal"
+    FIXED_CONFIG = "fixed_config"
     FORCE_POLICY = "force_policy"
     EXHAUSTIVE_COLLECTION = "exhaustive_collection"
 
@@ -349,6 +350,42 @@ class LibCache(object):
 libcache = LibCache(FLAGGEMS_DB_URL)
 
 
+def _bench_ascend_graph(fn, rep, quantiles):
+    """Measure NPU graph replay with the same quantile contract as Triton."""
+    import torch
+    from triton.testing import _summarize_statistics
+
+    device = torch.npu
+    stream = device.Stream()
+    stream.wait_stream(device.current_stream())
+    with device.stream(stream):
+        fn()
+        start = device.Event(enable_timing=True)
+        end = device.Event(enable_timing=True)
+        start.record()
+        for _ in range(5):
+            fn()
+        end.record()
+        device.synchronize()
+        estimate = start.elapsed_time(end) / 5
+        repeats = 1000 if estimate == 0 else max(1, int(rep / estimate))
+        graph = device.NPUGraph()
+        with device.graph(graph, stream=stream):
+            for _ in range(repeats):
+                fn()
+        device.synchronize()
+        samples = []
+        for _ in range(10):
+            start.record()
+            graph.replay()
+            end.record()
+            device.synchronize()
+            samples.append(start.elapsed_time(end) / repeats)
+        graph.reset()
+    device.current_stream().wait_stream(stream)
+    return _summarize_statistics(samples, quantiles, "mean")
+
+
 class LibTuner(triton.runtime.Autotuner):
     """`LibTuner` is the base class for `FlagGems` library autotuner.
 
@@ -417,8 +454,14 @@ class LibTuner(triton.runtime.Autotuner):
             unadapted, preserving its Default/Expanded routes.
         """
         benchmark_retries = DEFAULT_BENCHMARK_RETRIES
+        ascend_graph_bench = False
+        graph_protocol = None
         if do_bench is None and major_version >= 3 and minor_version >= 2:
             if use_cuda_graph:
+                ascend_graph_bench = runtime.device.vendor_name == "ascend"
+                graph_protocol = {
+                    "ascend": "ascend_npu_graph",
+                }.get(runtime.device.vendor_name)
                 from triton.testing import do_bench_cudagraph
 
                 def do_bench(kernel_call, quantiles):
@@ -430,6 +473,12 @@ class LibTuner(triton.runtime.Autotuner):
                             importlib.import_module("torchada")
                         finally:
                             triton.next_power_of_2 = next_power_of_2
+                    if device.vendor_name == "ascend":
+                        return _bench_ascend_graph(
+                            kernel_call,
+                            rep=rep if rep is not None else 100,
+                            quantiles=quantiles,
+                        )
                     return do_bench_cudagraph(
                         kernel_call,
                         rep=rep if rep is not None else 100,
@@ -445,6 +494,8 @@ class LibTuner(triton.runtime.Autotuner):
                         rep=rep if rep is not None else 100,
                         quantiles=quantiles,
                     )
+
+        self._ascend_graph_bench = ascend_graph_bench
 
         # NOTE(zhengyang): See discussion in https://github.com/triton-lang/triton/pull/4496
         if major_version == 2 or (major_version == 3 and minor_version <= 1):
@@ -498,7 +549,14 @@ class LibTuner(triton.runtime.Autotuner):
             )
         if do_bench is not None:
             self.benchmark_protocol = None
-            self._benchmark_protocol = ("custom_do_bench", -1, -1)
+            if graph_protocol is not None:
+                self._benchmark_protocol = (
+                    graph_protocol,
+                    0,
+                    rep if rep is not None else 100,
+                )
+            else:
+                self._benchmark_protocol = ("custom_do_bench", -1, -1)
         else:
             self.benchmark_protocol = None
             self._benchmark_protocol = (
@@ -581,6 +639,8 @@ class LibTuner(triton.runtime.Autotuner):
         self.cache = libcache[self.config_table_name]
 
     def apply_flagtune(self, arguments=None):
+        if getattr(self, "_run_mode", None) is LibTunerRunMode.FIXED_CONFIG:
+            return False
         supports_cost_model = _supports_flagtune_cost_model(self)
         if self._flagtune_op_name is None and not supports_cost_model:
             return False
@@ -796,7 +856,8 @@ class LibTuner(triton.runtime.Autotuner):
         """Apply an explicit config-selection mode to one scoped operator call.
 
         Args:
-            mode: ``normal`` uses ConfigCache normally; ``force_policy`` skips
+            mode: ``normal`` uses ConfigCache normally; ``fixed_config`` launches
+                the explicitly supplied singleton config; ``force_policy`` skips
                 ConfigCache while preserving the active policy; and
                 ``exhaustive_collection`` skips ConfigCache and forces the
                 exhaustive default policy while retaining BenchmarkCache.
@@ -842,11 +903,21 @@ class LibTuner(triton.runtime.Autotuner):
         overrides cannot leak into normal runtime autotuning.
         """
         selected_mode = BenchmarkMode(benchmark_mode)
-        resolved = resolve_benchmarker(
-            selected_mode,
+        require_ascend_graph = selected_mode is BenchmarkMode.REPLAY and getattr(
+            self, "_ascend_graph_bench", False
+        )
+        resolver = resolve_benchmarker
+        if require_ascend_graph:
+            # Older Ascend FlagTree releases resolve replay to event timing.
+            from flag_gems.flagtune.offline.runtime.benchmark_protocol import (
+                resolve_benchmarker as resolver,
+            )
+        resolved = resolver(
+            selected_mode.value,
             warmup_ms=warmup,
             measurement_ms=rep,
             n_retries=benchmark_retries,
+            allow_fallback=not require_ascend_graph,
         )
         previous_protocol = self._benchmark_protocol
         previous_public_protocol = self.benchmark_protocol
@@ -1010,10 +1081,16 @@ class LibTuner(triton.runtime.Autotuner):
         self.benchmark_cache_hit_count = 0
         # Bind this invocation before consulting its model's failure state.
         self.nargs = dict(zip(self.arg_names, args))
+        run_mode = LibTunerRunMode(getattr(self, "_run_mode", LibTunerRunMode.NORMAL))
+        fixed_config = run_mode is LibTunerRunMode.FIXED_CONFIG
         retry_cost_model = False
         # Direct callers must reselect when switching model identities, and
         # revisit a failed identity before a best-config cache hit bypasses it.
-        if _supports_flagtune_cost_model(self) and cost_model._COST_MODEL_DISABLED_OPS:
+        if (
+            not fixed_config
+            and _supports_flagtune_cost_model(self)
+            and cost_model._COST_MODEL_DISABLED_OPS
+        ):
             arguments = {**self.nargs, **kwargs}
             key = cost_model.failure_key(self, arguments)
             failure = cost_model.auto_failure_state(*key)
@@ -1023,7 +1100,6 @@ class LibTuner(triton.runtime.Autotuner):
                 runtime.resolve_cost_model_intent(supports_cost_model=True)
                 is runtime.CostModelIntent.AUTO
             )
-        run_mode = LibTunerRunMode(getattr(self, "_run_mode", LibTunerRunMode.NORMAL))
         self._flagtune_fallback_cache = None
         bypass_config_cache = run_mode is not LibTunerRunMode.NORMAL or retry_cost_model
         exhaustive_collection = run_mode is LibTunerRunMode.EXHAUSTIVE_COLLECTION
@@ -1038,7 +1114,11 @@ class LibTuner(triton.runtime.Autotuner):
         )
         # In CM mode the policy first resolves the actual runtime domain. A
         # singleton Default list says nothing about Expanded's candidate count.
-        if len(self.configs) > 1 or bypass_config_cache or cost_model_mode:
+        if fixed_config and len(self.configs) != 1:
+            raise ValueError("fixed_config requires exactly one config")
+        if not fixed_config and (
+            len(self.configs) > 1 or bypass_config_cache or cost_model_mode
+        ):
             all_args = {**self.nargs, **kwargs}
             _args = {k: v for k, v in all_args.items() if k in self.arg_names}
             config_key = self.get_key(_args)

@@ -211,9 +211,9 @@ def merge_sqlite_shards(target: Path, shards: Sequence[Path]) -> dict[str, int]:
         Counts of visited shard tables and newly inserted rows.
 
     Implementation:
-        All available shards are attached to one target connection.  Missing
-        tables are created from shard DDL and copied with ``INSERT OR IGNORE``
-        inside a target transaction.
+        Each shard is attached and detached separately. Missing tables are
+        created from shard DDL and copied with ``INSERT OR IGNORE`` in a
+        per-shard transaction. A retry preserves previously inserted rows.
 
     Limitations:
         Tables are assumed to have compatible schemas and conflict keys.  A
@@ -224,42 +224,41 @@ def merge_sqlite_shards(target: Path, shards: Sequence[Path]) -> dict[str, int]:
     table_count = 0
     inserted_rows = 0
     conn = sqlite3.connect(target, timeout=60.0)
-    aliases = []
     try:
-        for index, shard in enumerate(shards):
+        for shard in shards:
             if not shard.exists():
                 continue
-            alias = f"worker_{index}"
+            alias = "worker_shard"
             conn.execute(
                 f"ATTACH DATABASE ? AS {quote_identifier(alias)}", (str(shard),)
             )
-            aliases.append(alias)
-        with conn:
-            for alias in aliases:
-                rows = conn.execute(
-                    f"SELECT name, sql FROM {quote_identifier(alias)}.sqlite_master "
-                    "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-                ).fetchall()
-                for table_name, create_sql in rows:
-                    if not create_sql:
-                        continue
-                    create_if_missing = re.sub(
-                        r"^CREATE TABLE\s+",
-                        "CREATE TABLE IF NOT EXISTS ",
-                        create_sql,
-                        count=1,
-                    )
-                    conn.execute(create_if_missing)
-                    before = conn.total_changes
-                    quoted_table = quote_identifier(table_name)
-                    conn.execute(
-                        f"INSERT OR IGNORE INTO main.{quoted_table} "
-                        f"SELECT * FROM {quote_identifier(alias)}.{quoted_table}"
-                    )
-                    inserted_rows += conn.total_changes - before
-                    table_count += 1
-        for alias in aliases:
-            conn.execute(f"DETACH DATABASE {quote_identifier(alias)}")
+            try:
+                with conn:
+                    conn.execute("BEGIN")
+                    rows = conn.execute(
+                        f"SELECT name, sql FROM {quote_identifier(alias)}.sqlite_master "
+                        "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                    ).fetchall()
+                    for table_name, create_sql in rows:
+                        if not create_sql:
+                            continue
+                        create_if_missing = re.sub(
+                            r"^CREATE TABLE\s+",
+                            "CREATE TABLE IF NOT EXISTS ",
+                            create_sql,
+                            count=1,
+                        )
+                        conn.execute(create_if_missing)
+                        before = conn.total_changes
+                        quoted_table = quote_identifier(table_name)
+                        conn.execute(
+                            f"INSERT OR IGNORE INTO main.{quoted_table} "
+                            f"SELECT * FROM {quote_identifier(alias)}.{quoted_table}"
+                        )
+                        inserted_rows += conn.total_changes - before
+                        table_count += 1
+            finally:
+                conn.execute(f"DETACH DATABASE {quote_identifier(alias)}")
     finally:
         conn.close()
     return {"visited_tables": table_count, "inserted_rows": inserted_rows}

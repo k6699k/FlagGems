@@ -1,0 +1,45 @@
+schema_version: 3
+op_id: flaggems/mv
+pretune:
+  shape:
+    fields:
+      N: {type: int, min: 2}
+      K: {type: int, min: 1024}
+    identity: [N, K]
+  dispatch: {policy: first_match, order: [column_gemv]}
+  benchmark:
+    tensors:
+      a: {factory: randn, shape: [N, K], dtype: runtime, layout: {literal: transposed_2d}}
+      b: {factory: randn, shape: [K], dtype: runtime}
+    invoke: {kind: flag_gems_public, args: [a, b]}
+variants:
+  column_gemv:
+    inputs:
+      N: {min: 2}
+      K: {min: 1024}
+      STRIDE_K: {default: N, min: 1}
+      STRIDE_X: {default: 1, min: 0}
+      SPLIT: {default: 0, min: 0, max: 1}
+    when: {op: ge, args: [K, 1024]}
+    params:
+      BLOCK_N: {values: [16, 32, 64, 128, 256]}
+      BLOCK_K: {values: [32, 64, 128, 256]}
+      CHUNK_K: {values: [0, 128, 256, 512]}
+      num_stages: {values: [1, 2]}
+      num_warps: {values: [4]}
+    features:
+      - {name: N, op: ident, args: [N]}
+      - {name: K, op: ident, args: [K]}
+      - {name: STRIDE_K, op: ident, args: [STRIDE_K]}
+      - {name: STRIDE_X, op: ident, args: [STRIDE_X]}
+      - {name: SPLIT, op: ident, args: [SPLIT]}
+      - {name: BLOCK_N, op: ident, args: [BLOCK_N]}
+      - {name: BLOCK_K, op: ident, args: [BLOCK_K]}
+      - {name: CHUNK_K, op: ident, args: [CHUNK_K]}
+      - {name: num_stages, op: ident, args: [num_stages]}
+      - {name: num_warps, op: ident, args: [num_warps]}
+      - {name: output_tiles, op: cdiv, args: [N, BLOCK_N]}
+      - {name: reduction_tiles, op: cdiv, args: [K, BLOCK_K]}
+      - {name: tile_elements, op: mul, args: [BLOCK_N, BLOCK_K]}
+      - {name: tail_n, op: mod, args: [N, BLOCK_N]}
+      - {name: tail_k, op: mod, args: [K, BLOCK_K]}

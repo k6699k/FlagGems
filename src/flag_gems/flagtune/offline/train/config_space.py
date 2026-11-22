@@ -21,6 +21,14 @@ import json
 from typing import Any, Optional
 
 _MM_RUNTIME_OPS = {
+    "ascend": {
+        "ascend_gemm": "mm_ascend",
+        "rectangular": "mm_rectangular_ascend",
+        "narrow_gemv": "mm_narrow_gemv_ascend",
+        "packed_narrow": "mm_packed_narrow_ascend",
+        "wide_panels": "panel_gemm_ascend",
+        "large_panels": "panel_gemm_ascend",
+    },
     "nvidia": {
         "general_tma": "mm_general_tma",
         "gemv": "gemv",
@@ -46,9 +54,35 @@ _MM_RUNTIME_OPS = {
 
 _RUNTIME_OPS = {
     "flaggems/mm": _MM_RUNTIME_OPS,
+    "flaggems/bmm": {
+        "ascend": {
+            "batched_gemm": "bmm_ascend",
+            "tiled_gemm": "tiled_gemm_ascend",
+            "narrow_gemv": "narrow_gemv_ascend",
+        },
+    },
+    "flaggems/baddbmm": {
+        "ascend": {
+            "batched_gemm": "baddbmm_ascend",
+            "tiled_gemm": "tiled_gemm_ascend",
+            "narrow_gemv": "narrow_gemv_ascend",
+        },
+    },
+    "flaggems/addmm": {
+        "ascend": {
+            "gemm": "addmm_ascend",
+            "tiled_gemm": "tiled_gemm_ascend",
+            "narrow_gemv": "narrow_gemv_ascend",
+            "wide_panels": "panel_gemm_ascend",
+        },
+    },
+    "flaggems/mv": {
+        "ascend": {"gemv": "mv_ascend", "column_gemv": "mv_column_ascend"},
+    },
     "flaggems/mul": {
         "scalar": "mul",
         "broadcast_2d": "mul_broadcast_2d",
+        "broadcast_tiled": "mul_broadcast_tiled",
     },
 }
 
@@ -96,18 +130,65 @@ def runtime_configs_for_variant(
         or "cuda" in platform_text
     ):
         platform_name = "nvidia"
+    elif "ascend" in platform_text or platform_text == "npu":
+        platform_name = "ascend"
     else:
         platform_name = platform_text
+    op_name = runtime_op_name_for_variant(op_id, variant, platform_name)
+    if op_name is None:
+        return None
     expand_yaml_path = yaml_path
+    if expand_yaml_path is None and op_name in {
+        "mm_narrow_gemv_ascend",
+        "mm_packed_narrow_ascend",
+        "mm_rectangular_ascend",
+        "narrow_gemv_ascend",
+        "panel_gemm_ascend",
+    }:
+        from flag_gems.runtime.backend._ascend.gemm_tuning import FIXED_GEMM_EXPAND_PATH
+
+        expand_yaml_path = FIXED_GEMM_EXPAND_PATH
+    if (
+        expand_yaml_path is None
+        and platform_name == "ascend"
+        and variant == "tiled_gemm"
+    ):
+        from flag_gems.flagtune.offline.train.route.common import backend_module
+
+        expand_yaml_path = backend_module("bmm", platform_name)._TILED_EXPAND_PATH
     if expand_yaml_path is None and op_id == "flaggems/mm":
         from flag_gems.flagtune.offline.train.route.common import backend_module
 
         backend = backend_module("mm", platform_name)
         expand_yaml_path = getattr(backend, "EXPAND_CONFIG_FILENAME", None)
+    if (
+        expand_yaml_path is None
+        and op_id == "flaggems/mul"
+        and platform_name == "ascend"
+    ):
+        from flag_gems.flagtune.offline.train.route.common import backend_module
 
-    op_name = runtime_op_name_for_variant(op_id, variant, platform_name)
-    if op_name is None:
-        return None
+        expand_yaml_path = backend_module("mul", platform_name)._MUL_EXPAND_PATH
+    if (
+        expand_yaml_path is None
+        and op_id == "flaggems/bmm"
+        and platform_name == "ascend"
+    ):
+        from flag_gems.flagtune.offline.train.route.common import backend_module
+
+        expand_yaml_path = backend_module("bmm", platform_name)._BMM_EXPAND_PATH
+    if expand_yaml_path is None and platform_name == "ascend":
+        names = {
+            "flaggems/mv": ("mv", "_MV_EXPAND_PATH"),
+            "flaggems/addmm": ("addmm", "_ADDMM_EXPAND_PATH"),
+            "flaggems/baddbmm": ("baddbmm", "_BADDBMM_EXPAND_PATH"),
+        }
+        if op_id in names:
+            from flag_gems.flagtune.offline.train.route.common import backend_module
+
+            module, attr = names[op_id]
+            expand_yaml_path = getattr(backend_module(module, platform_name), attr)
+
     configs = runtime.ops_get_configs(
         op_name,
         yaml_path=expand_yaml_path,

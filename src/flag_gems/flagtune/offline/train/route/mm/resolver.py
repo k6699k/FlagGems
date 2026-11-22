@@ -24,7 +24,24 @@ from .hopper import select_mm_route as _select_hopper_mm_route
 from .metax import dynamic_inputs as _metax_dynamic_inputs
 from .metax import select_mm_route as _select_metax_mm_route
 
+ASCEND_ROUTES = {
+    "ascend_gemm": ("ascend_gemm", "public"),
+    "rectangular_bf16": ("rectangular", "public"),
+    "rectangular_fixed": ("rectangular", "public"),
+    "rectangular_wide": ("rectangular", "public"),
+    "rectangular": ("rectangular", "public"),
+    "narrow_gemv": ("narrow_gemv", "public"),
+    "packed_narrow4": ("packed_narrow", "compute"),
+    "packed_narrow16": ("packed_narrow", "compute"),
+    "packed_narrow": ("packed_narrow", "compute"),
+    "packed_narrow_nt": ("packed_narrow_nt", "public"),
+    "direct_nt_tiled": ("direct_nt_tiled", "public"),
+    "wide_panels": ("wide_panels", "compute"),
+    "large_panels": ("large_panels", "compute"),
+}
+
 ADAPTED_VARIANTS = {
+    "ascend": frozenset(ASCEND_ROUTES),
     "nvidia": frozenset(
         {
             "gemv",
@@ -67,12 +84,19 @@ def _select_mm_route(a: Any, b: Any, module: Any | None = None) -> str:
         module = backend_module("mm", platform_name)
     else:
         module_name = str(getattr(module, "__name__", ""))
-        platform_name = "metax" if "_metax" in module_name else "nvidia"
+        if "_ascend" in module_name:
+            platform_name = "ascend"
+        elif "_metax" in module_name:
+            platform_name = "metax"
+        else:
+            platform_name = "nvidia"
     if module is None:
         raise RuntimeError(
             f"MM route selector is unavailable for platform {platform_name!r}; "
             "route prediction requires real tensors and the backend selector"
         )
+    if platform_name == "ascend":
+        return module._select_mm_route(a, b)
     if platform_name == "metax":
         return _select_metax_mm_route(a, b, module)
     return _select_hopper_mm_route(a, b, module)
@@ -117,14 +141,13 @@ def route_metadata_for_variant(
             physical = route
             break
     adapted = physical in ADAPTED_VARIANTS.get(platform_name, frozenset())
-    tuning_variant, stage = ROUTE_TO_STAGE.get(physical, (physical, "public"))
+    routes = ASCEND_ROUTES if platform_name == "ascend" else ROUTE_TO_STAGE
+    tuning_variant, stage = routes.get(physical, (physical, "public"))
     return {
         "route_variant": physical,
         "tuning_variant": tuning_variant if adapted else None,
         "stage": stage if adapted else None,
-        "latency_scope": (
-            "partial_kernel" if stage == "partial" and adapted else "public_kernel"
-        ),
+        "latency_scope": (f"{stage}_kernel" if adapted else "public_kernel"),
         "physical_route": physical,
         "cost_model_variant": tuning_variant if adapted else None,
         "dynamic_inputs": dict(dynamic_inputs or {}),

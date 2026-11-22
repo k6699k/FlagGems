@@ -1,0 +1,53 @@
+tiled_gemm_ascend:
+  - config:
+    param_map: &params
+      META: {BM: bm, BN: bn, BK: bk}
+      num_stages: stages
+      num_warps: warps
+    bm: [16, 32]
+    bn: [16, 32, 64]
+    bk: [64, 128, 256]
+    stages: &stages [1, 2]
+    warps: &warps [4]
+  - config:
+    param_map: *params
+    bm: [64]
+    bn: [32, 64]
+    bk: [64, 128, 256]
+    stages: *stages
+    warps: *warps
+  - config:
+    param_map: *params
+    bm: [16, 32, 64]
+    bn: [64, 128]
+    bk: [256, 512]
+    stages: *stages
+    warps: *warps
+  - config:
+    param_map: *params
+    bm: [128]
+    bn: [128, 256]
+    bk: [128, 256]
+    stages: *stages
+    warps: *warps
+  - config:
+    param_map: *params
+    bm: [32, 64]
+    bn: [256]
+    bk: [128, 256]
+    stages: *stages
+    warps: *warps
+  - config:
+    param_map: *params
+    bm: [256]
+    bn: [128]
+    bk: [256]
+    stages: *stages
+    warps: *warps
+  - config:
+    param_map: *params
+    bm: [16]
+    bn: [512]
+    bk: [128]
+    stages: *stages
+    warps: *warps

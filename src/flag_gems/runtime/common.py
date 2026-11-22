@@ -141,6 +141,7 @@ DEFAULT_STRATEGIES = {
     # separate from the generic two-key MV contract used by other backends.
     "mv_hygon": ["align32", "align32", "default", "default", "default"],
     "mul": ["align32", "default"],
+    "mul_broadcast_tiled": ["default"] * 7,
     "mul_broadcast_2d": ["align32", "default", "default"],
     "mul_broadcast_2d_dense_row": ["align32", "default", "default", "default"],
     "mul_broadcast_2d_metax": ["align32"] + ["default"] * 9,
@@ -500,6 +501,7 @@ OP_KEY_ORDERS = {
     "mv_reduce": ["M", "BATCH", "SPLIT_K", "SYB", "SYM"],
     "mv_hygon": ["M", "N", "stride_an", "stride_am", "stride_bm"],
     "mul": ["n_elements", "dtype"],
+    "mul_broadcast_tiled": ["M", "N", "dtype", "a_s0", "a_s1", "b_s0", "b_s1"],
     "mul_broadcast_2d": ["n_elements", "n_cols", "dtype"],
     "mul_broadcast_2d_dense_row": [
         "n_elements",

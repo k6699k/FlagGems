@@ -16,6 +16,7 @@ import logging
 import math
 from functools import lru_cache
 from numbers import Number
+from pathlib import Path
 
 import torch
 import triton
@@ -31,6 +32,9 @@ from flag_gems.utils.shape_utils import volume
 logger = logging.getLogger(__name__)
 
 _DEVICE_NAME = runtime_device.name
+_MUL_EXPAND_PATH = str(
+    Path(__file__).resolve().parent.parent / "mul_ascend_expand.yaml"
+)
 
 _FALLBACK_KEYSET = torch._C.DispatchKeySet(
     torch._C.DispatchKey.CompositeExplicitAutograd
@@ -125,19 +129,27 @@ def _prune_mul_flat_configs(configs, named_args, **kwargs):
     args = {**named_args, **kwargs}
     if _DEVICE_NAME != "npu":
         return configs
-    n = args["n_elements"]
-    max_block = max(128, triton.next_power_of_2(max(1, n)))
-    usable = [c for c in configs if c.kwargs["BLOCK_SIZE"] <= max_block]
-    if not usable:
-        usable = [min(configs, key=lambda c: c.kwargs["BLOCK_SIZE"])]
-    counts = {id(c): triton.cdiv(n, c.kwargs["BLOCK_SIZE"]) for c in usable}
-    limit = max(1, 2 * min(counts.values()))
-    return [c for c in usable if counts[id(c)] <= limit]
+    pruned = [
+        c
+        for c in configs
+        if triton.cdiv(args["n_elements"], c.kwargs["BLOCK_SIZE"]) <= 65535
+    ]
+    if not pruned:
+        raise RuntimeError("No valid MUL scalar configurations after pruning")
+    return pruned
 
 
 def mul_get_configs():
     return [
         triton.Config({"BLOCK_SIZE": 1024}, num_warps=4, num_stages=3),
+    ]
+
+
+def mul_scalar_get_configs():
+    return [
+        triton.Config({"BLOCK_SIZE": block_size}, num_warps=4, num_stages=stages)
+        for block_size in (128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
+        for stages in (1, 3)
     ]
 
 
@@ -261,14 +273,16 @@ def mul_contiguous_chunked_kernel(
 
 @libentry()
 @libtuner(
-    configs=mul_get_configs(),
+    configs=mul_scalar_get_configs(),
     prune_configs_by={"early_config_prune": _prune_mul_flat_configs},
     key=["n_elements", "dtype"],
     strategy=["align32", "default"],
     warmup=5,
     rep=5,
+    use_cuda_graph=True,
     flagtune_op_name="mul",
     flagtune_expand_op_name="mul",
+    flagtune_yaml_path=_MUL_EXPAND_PATH,
     flagtune_op_id="flaggems/mul",
     flagtune_variant="scalar",
     policy="flagtune",
@@ -784,52 +798,55 @@ def _launch_scalar(tensor, scalar, output, dtype):
 def _prune_mul_tiled_configs(configs, named_args, **kwargs):
     args = {**named_args, **kwargs}
     m, n = args["M"], args["N"]
-    max_m = triton.next_power_of_2(m)
-    max_n = max(32, triton.next_power_of_2(n))
-    dense_operand = (args["a_s0"] != 0 and args["a_s1"] != 0) or (
-        args["b_s0"] != 0 and args["b_s1"] != 0
+    tile_limit = 1048576
+    lhs_strides = (args.get("a_s0"), args.get("a_s1"))
+    rhs_strides = (args.get("b_s0"), args.get("b_s1"))
+    row_broadcast_and_dense = (lhs_strides == (1, 0) and rhs_strides == (n, 1)) or (
+        rhs_strides == (1, 0) and lhs_strides == (n, 1)
     )
-    max_elements = 8192 if args["dtype"] == "bfloat16" and dense_operand else 16384
+    dtype = args.get("dtype")
+    if n > 1 and row_broadcast_and_dense and dtype in ("bfloat16", "float32"):
+        target = triton.runtime.driver.active.get_current_target()
+        if str(target.arch).startswith("Ascend910_93"):
+            # For this layout, measured UB failures start at 32K BF16 or
+            # 64K FP32 tile elements on 910C. Outer products have a
+            # different UB footprint and retain their existing candidates.
+            tile_limit = 32767 if dtype == "bfloat16" else 65535
+
+    # CANN's launch grid is limited to 65535 programs.
     pruned = [
         c
         for c in configs
-        if c.kwargs["BLOCK_M"] <= max_m
-        and c.kwargs["BLOCK_N"] <= max_n
-        and c.kwargs["BLOCK_M"] * c.kwargs["BLOCK_N"] <= max_elements
+        if triton.cdiv(m, c.kwargs["BLOCK_M"]) * triton.cdiv(n, c.kwargs["BLOCK_N"])
+        <= 65535
+        and c.kwargs["BLOCK_M"] * c.kwargs["BLOCK_N"] <= tile_limit
     ]
     if not pruned:
         raise RuntimeError("No valid MUL tiled configurations after pruning")
-    widest = max(c.kwargs["BLOCK_N"] for c in pruned)
-    wide = [c for c in pruned if c.kwargs["BLOCK_N"] >= max(32, widest // 2)]
-    counts = {
-        id(c): triton.cdiv(m, c.kwargs["BLOCK_M"]) * triton.cdiv(n, c.kwargs["BLOCK_N"])
-        for c in wide
-    }
-    limit = max(1, 2 * min(counts.values()))
-    return [c for c in wide if counts[id(c)] <= limit]
+    return pruned
 
 
-class _MulTiledTuner(LibTuner):
-    @staticmethod
-    def policy(bench_fn, configs, args, kwargs):
-        timings = {}
-        for config in configs:
-            try:
-                measured = bench_fn(config)
-            except Exception as exc:
-                if type(exc).__name__ != "MLIRCompilationError" or not type(
-                    exc
-                ).__module__.startswith("triton."):
-                    raise
-                logger.warning("MUL tiled compile rejected %s: %s", config, exc)
-                measured = [float("inf")] * 3
-            timings[config] = measured
-        valid = {c: t for c, t in timings.items() if all(math.isfinite(v) for v in t)}
-        if not valid:
+class _MulTiledTuner(LibTuner.get("flagtune")):
+    def __init__(self, *args, **kwargs):
+        """Bind the physical tiled kernel to its own model contract."""
+        kwargs.update(
+            flagtune_op_id="flaggems/mul",
+            flagtune_variant="broadcast_tiled",
+        )
+        super().__init__(*args, **kwargs)
+
+    def policy(self, bench_fn, configs, args, kwargs):
+        # Compilation failures must never win a wholly failed search.
+        best, timings = super().policy(bench_fn, configs, args, kwargs)
+        finite = (
+            value[0] if isinstance(value, (list, tuple)) else value
+            for value in timings.values()
+        )
+        if not any(math.isfinite(value) for value in finite):
             raise RuntimeError(
                 "All MUL tiled configurations failed; inspect compile logs"
             )
-        return min(valid, key=valid.get), timings
+        return best, timings
 
 
 @libentry()
@@ -841,6 +858,10 @@ class _MulTiledTuner(LibTuner):
     warmup=5,
     rep=5,
     policy=_MulTiledTuner,
+    use_cuda_graph=True,
+    flagtune_op_name="mul",
+    flagtune_expand_op_name="mul_broadcast_tiled",
+    flagtune_yaml_path=_MUL_EXPAND_PATH,
 )
 @triton.jit
 def mul_broadcast_tiled_kernel(

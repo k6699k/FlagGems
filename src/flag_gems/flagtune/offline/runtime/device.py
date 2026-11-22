@@ -48,6 +48,7 @@ class _RuntimeBackend:
 
 
 _RUNTIME_BACKENDS = {
+    "npu": _RuntimeBackend(("ASCEND_RT_VISIBLE_DEVICES",)),
     "cuda": _RuntimeBackend(("CUDA_VISIBLE_DEVICES",)),
     # PyTorch ROCm uses torch.cuda while launchers may use any of these names.
     "hip": _RuntimeBackend(

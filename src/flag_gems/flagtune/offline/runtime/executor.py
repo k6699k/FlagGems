@@ -615,7 +615,7 @@ class BenchmarkWorker:
                     int(evaluate_compiled(dim, values, {})) for dim in tensor.shape
                 )
             layout = evaluate_compiled(tensor.layout, values, {})
-            if layout not in {"contiguous", "transposed_2d"}:
+            if layout not in {"contiguous", "transposed_2d", "transposed_last2"}:
                 raise BenchmarkExecutionError(
                     f"unsupported tensor layout {layout!r} for {tensor.name!r}"
                 )
@@ -623,17 +623,20 @@ class BenchmarkWorker:
                 raise BenchmarkExecutionError(
                     f"transposed_2d tensor {tensor.name!r} requires a two-dimensional shape"
                 )
+            transposed = layout in {"transposed_2d", "transposed_last2"}
+            if transposed and len(shape) < 2:
+                raise BenchmarkExecutionError(
+                    f"transposed tensor {tensor.name!r} requires at least two dimensions"
+                )
             allocation_shape = (
-                tuple(reversed(shape)) if layout == "transposed_2d" else shape
+                (*shape[:-2], shape[-1], shape[-2]) if transposed else shape
             )
             value = self.device_runtime.make_tensor(
                 tensor.factory,
                 allocation_shape,
                 dtype=dtype_by_tensor[tensor.name],
             )
-            tensors[tensor.name] = (
-                value.transpose(0, 1) if layout == "transposed_2d" else value
-            )
+            tensors[tensor.name] = value.transpose(-2, -1) if transposed else value
         return tensors
 
     def _resolve_runtime_route(
@@ -658,6 +661,7 @@ class BenchmarkWorker:
                 runtime_context={
                     "platform_key": gpu["platform_key"],
                     "recipe": dict(values),
+                    "requested_tuning_variant": tuning_variant(self.spec, variant),
                 },
             )
         except (KeyError, RuntimeError, ValueError, AttributeError) as exc:
@@ -942,12 +946,16 @@ class BenchmarkWorker:
             )
         )
 
-        from flag_gems.utils.libentry import clear_libentry_dispatch_cache
+        from flag_gems.utils.libentry import (
+            LibTunerRunMode,
+            clear_libentry_dispatch_cache,
+        )
 
         clear_libentry_dispatch_cache(kernel)
         tuner._set_configs_and_strategy([configs[labels[0]]], base_strategy)
         try:
-            self._invoke(tensors, variant)
+            with tuner.use_run_mode(LibTunerRunMode.FIXED_CONFIG):
+                self._invoke(tensors, variant)
             self.device_runtime.synchronize()
         finally:
             tuner._set_configs_and_strategy(base_configs, base_strategy)

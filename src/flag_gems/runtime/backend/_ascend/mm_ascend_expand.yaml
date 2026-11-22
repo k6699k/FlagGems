@@ -1,0 +1,86 @@
+mm_ascend:
+  # Compact output tiles.
+  - config:
+    include_default_configs: false
+    param_map: &mm_params
+      META: {BLOCK_M: block_m, BLOCK_N: block_n, BLOCK_K: block_k, SPLIT_K: split_k}
+      num_stages: stages
+      num_warps: warps
+    block_m: [16, 32]
+    block_n: [32, 64]
+    block_k: [32, 64, 128]
+    split_k: &single_k [1]
+    stages: &mm_stages [1, 2, 3]
+    warps: &mm_warps [4]
+
+  # Short M, wider rows.
+  - config:
+    param_map: *mm_params
+    block_m: [16, 32]
+    block_n: [128]
+    block_k: [64, 128, 256]
+    split_k: *single_k
+    stages: *mm_stages
+    warps: *mm_warps
+
+  # Narrow N, taller tiles.
+  - config:
+    param_map: *mm_params
+    block_m: [64, 128]
+    block_n: [32]
+    block_k: [64, 128, 256]
+    split_k: *single_k
+    stages: *mm_stages
+    warps: *mm_warps
+
+  # General rectangular and square tiles.
+  - config:
+    param_map: *mm_params
+    block_m: [64, 128]
+    block_n: [64, 128]
+    block_k: [64, 128, 256]
+    split_k: *single_k
+    stages: *mm_stages
+    warps: *mm_warps
+
+  # Large aligned, wide orientation.
+  - config:
+    param_map: *mm_params
+    block_m: [128]
+    block_n: [256]
+    block_k: [128, 256]
+    split_k: *single_k
+    stages: *mm_stages
+    warps: *mm_warps
+
+  # Large aligned, tall orientation.
+  - config:
+    param_map: *mm_params
+    block_m: [256]
+    block_n: [128]
+    block_k: [128, 256]
+    split_k: *single_k
+    stages: *mm_stages
+    warps: *mm_warps
+
+  # Long K, compact output tile.
+  - config:
+    param_map: *mm_params
+    block_m: [16]
+    block_n: [64]
+    block_k: [512, 1024]
+    split_k: *single_k
+    stages: *mm_stages
+    warps: *mm_warps
+
+  # Larger K, rectangular and square output tiles.
+  - config:
+    param_map: *mm_params
+    block_m: [64, 128]
+    block_n: [128]
+    block_k: [512]
+    split_k: *single_k
+    stages: *mm_stages
+    warps: *mm_warps
+
+  - strategy: {M: default, N: default, K: default}

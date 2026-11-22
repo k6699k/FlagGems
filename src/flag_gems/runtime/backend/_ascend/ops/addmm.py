@@ -13,14 +13,25 @@
 # limitations under the License.
 
 import logging
+from pathlib import Path
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.cann.extension as extension
 
+from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
+from flag_gems.runtime.backend._ascend.gemm_tuning import (
+    ResourcePrunedGemmTuner,
+    gemm_dtype_resolver,
+    is_ascend_910c,
+    launch_panel_gemm,
+    make_fixed_gemm_tuner,
+    prune_910c_addmm_stage3_tail,
+    prune_panel_gemm,
+)
 from flag_gems.utils import broadcastable_to, libentry, libtuner
 
 from .bmm import (
@@ -28,6 +39,8 @@ from .bmm import (
     _launch_narrow_pack,
     _launch_nt_gemm,
     _launch_tiled_gemm,
+    _make_narrow_gemv_tuner,
+    _make_tiled_tuner,
     _select_rectangular_tile,
     _use_narrow_gemv,
     _use_narrow_pack,
@@ -37,6 +50,11 @@ from .mm import _blockified, _mm_pack_wide_panels_kernel
 
 logger = logging.getLogger(__name__)
 _MAX_ADDMM_PROGRAMS = 32768
+addmm_tiled_kernel = _make_tiled_tuner("addmm")
+addmm_narrow_gemv_kernel = _make_narrow_gemv_tuner("addmm")
+_ADDMM_EXPAND_PATH = str(
+    Path(__file__).resolve().parent.parent / "addmm_ascend_expand.yaml"
+)
 
 
 # Keep addmm's validated fallback independent of the shared mm tuning space.
@@ -66,6 +84,17 @@ def _prune_addmm_configs(configs, named_args, **kwargs):
         or min(args["M"], args["N"]) < 128
     ):
         return _ADDMM_BASE_CONFIGS
+    if len(configs) > 7:
+        return [
+            c
+            for c in configs
+            if max(
+                c.kwargs["BLOCK_M"] * c.kwargs["BLOCK_N"],
+                c.kwargs["BLOCK_M"] * c.kwargs["BLOCK_K"],
+                c.kwargs["BLOCK_N"] * c.kwargs["BLOCK_K"],
+            )
+            <= 1048576
+        ]
     if args["M"] == args["N"] == args["K"]:
         if args["A"].dtype == torch.float32:
             tile = (64, 128, 128) if args["M"] < 512 else (256, 128, 128)
@@ -88,6 +117,25 @@ def _prune_addmm_configs(configs, named_args, **kwargs):
         for config in configs
         if tuple(config.kwargs[k] for k in ("BLOCK_M", "BLOCK_N", "BLOCK_K")) in tiles
     ]
+
+
+class _AddMMFlagTuneTuner(ResourcePrunedGemmTuner):
+    default_prune = staticmethod(_prune_addmm_configs)
+    tile_prefix = "BLOCK"
+
+    def _prune_candidates(self, configs, named_args, **kwargs):
+        valid = super()._prune_candidates(configs, named_args, **kwargs)
+        args = {**named_args, **kwargs}
+        if args["A"].dtype == torch.bfloat16 and is_ascend_910c():
+            m, n, k = (args[axis] for axis in ("M", "N", "K"))
+            return [
+                config
+                for config in valid
+                if not prune_910c_addmm_stage3_tail(
+                    m, n, k, config.kwargs, config.num_stages
+                )
+            ]
+        return valid
 
 
 @libentry()
@@ -123,7 +171,15 @@ def _prune_addmm_configs(configs, named_args, **kwargs):
         "BETA_IS_ZERO",
         "DOT_PAD_ONLY_K",
     ],
-    prune_configs_by={"early_config_prune": _prune_addmm_configs},
+    warmup=5,
+    rep=5,
+    use_cuda_graph=True,
+    flagtune_op_name="addmm",
+    flagtune_expand_op_name="addmm_ascend",
+    flagtune_yaml_path=_ADDMM_EXPAND_PATH,
+    flagtune_op_id="flaggems/addmm",
+    flagtune_variant="gemm",
+    policy=_AddMMFlagTuneTuner,
 )
 @triton.heuristics(_ADDMM_HEURISTICS)
 @triton.jit(do_not_specialize=["alpha", "beta"])
@@ -380,6 +436,18 @@ def _addmm_wide_panel_kernel(
     tl.store(Out + offset, acc, m[:, None] < M)
 
 
+addmm_wide_panel_kernel = make_fixed_gemm_tuner(
+    _addmm_wide_panel_kernel,
+    "addmm",
+    "wide_panels",
+    ["M", "N", "K"],
+    {"BM": 128, "BK": 256},
+    prune_panel_gemm,
+    space="panel_gemm",
+    dtype_resolver=gemm_dtype_resolver("addmm", rhs="Packed"),
+)
+
+
 def _launch_wide_addmm(a, b, bias, out):
     m, k = a.shape
     n = b.shape[1]
@@ -390,42 +458,38 @@ def _launch_wide_addmm(a, b, bias, out):
         _mm_pack_wide_panels_kernel[(n // bn * (k // 64),)](
             b, packed, n, k, bn, 64, multibuffer=False
         )
-        _addmm_wide_panel_kernel[(triton.cdiv(m, bm) * (n // bn),)](
-            a,
-            packed,
-            bias,
-            out,
-            m,
-            n,
-            k,
+        launch_panel_gemm(
+            _addmm_wide_panel_kernel,
+            addmm_wide_panel_kernel,
+            (a, packed, bias, out),
+            (m, n, k),
             bm,
-            bn,
             256,
-            multibuffer=True,
-            unit_flag=True,
-            sync_solver=False,
         )
     return out
 
 
-def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
+def _is_contiguous_for_addmm_fallback(tensor):
+    return tensor.is_contiguous() or (tensor.stride(0) > 1 and tensor.stride(1) > 1)
+
+
+def _select_addmm_route(bias, mat1, mat2, *, alpha=1, beta=1, out=None):
     M, K = mat1.shape
     _, N = mat2.shape
-    if M == 0 or N == 0:
-        return out
+    output_dtype = mat1.dtype if out is None else out.dtype
     if (
         alpha == beta == 1
-        and bias.shape == out.shape
-        and bias.dtype == out.dtype == mat1.dtype
+        and bias.shape == (M, N)
+        and bias.dtype == output_dtype == mat1.dtype
         and bias.is_contiguous()
-        and out.is_contiguous()
+        and (out is None or out.is_contiguous())
     ):
         if _use_nt_gemm(mat1, mat2):
-            return _launch_nt_gemm(mat1, mat2, out, bias)
+            return "direct_nt", None
         if _use_narrow_gemv(mat1, mat2):
-            return _launch_narrow_gemv(mat1, mat2, out, bias)
+            return "narrow_gemv", None
         if _use_narrow_pack(mat1, mat2):
-            return _launch_narrow_pack(mat1, mat2, out, bias)
+            return "packed_rhs", None
         if (
             mat1.dtype == mat2.dtype
             and mat1.dtype in (torch.float16, torch.bfloat16)
@@ -437,7 +501,7 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
             and 1024 <= K <= 2048
             and K % 256 == 0
         ):
-            return _launch_wide_addmm(mat1, mat2, bias, out)
+            return "wide_panels", None
         tile = _select_rectangular_tile(mat1, mat2)
         if (
             tile is None
@@ -456,20 +520,18 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
             elif 0 < M <= 4 and N == 256 and K == 2048 and mat2.is_contiguous():
                 tile = (16, 64, 256, 4, True)
         if tile is not None:
-            return _launch_tiled_gemm(mat1, mat2, out, tile, bias)
+            return ("split_k" if tile[3] > 1 else "fixed_tile"), tile
         if (
             M == 1
             and K in (64, 128)
-            and N >= 1024
+            and 1024 <= N <= 65535 * 64
             and N % 64 == 0
             and mat1.dtype == mat2.dtype
             and mat1.dtype in (torch.float16, torch.bfloat16)
             and mat1.is_contiguous()
             and mat2.is_contiguous()
         ):
-            with torch_device_fn.device(mat1.device):
-                _addmm_row_vector[(N // 64,)](mat1, mat2, bias, out, N, K)
-            return out
+            return "row_vector", None
         if (
             M == N == 1
             and 0 < K <= 2048
@@ -478,28 +540,57 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
             and mat1.is_contiguous()
             and mat2.is_contiguous()
         ):
-            with torch_device_fn.device(mat1.device):
-                _addmm_scalar_dot[(1,)](
-                    mat1, mat2, bias, out, K, triton.next_power_of_2(K)
-                )
-            return out
+            return "scalar_dot", None
+    if (
+        runtime.resolve_tuning_mode("addmm", supports_cost_model=True)
+        == runtime.TuningMode.DEFAULT
+        and M == N == K
+        and (128 <= N < 512 or N == 1024)
+        and N % 128 == 0
+        and mat1.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and _is_contiguous_for_addmm_fallback(mat1)
+        and _is_contiguous_for_addmm_fallback(mat2)
+        and bias.shape == (M, N)
+        and bias.is_contiguous()
+        and (out is None or out.is_contiguous())
+    ):
+        return "small_square", None
+    return "gemm", None
+
+
+def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
+    M, K = mat1.shape
+    N = mat2.shape[1]
+    if M == 0 or N == 0:
+        return out
+    route, tile = _select_addmm_route(bias, mat1, mat2, alpha=alpha, beta=beta, out=out)
+    if route == "direct_nt":
+        return _launch_nt_gemm(mat1, mat2, out, bias, tuner=addmm_tiled_kernel)
+    if route == "narrow_gemv":
+        return _launch_narrow_gemv(
+            mat1, mat2, out, bias, tuner=addmm_narrow_gemv_kernel
+        )
+    if route == "packed_rhs":
+        return _launch_narrow_pack(mat1, mat2, out, bias)
+    if route == "wide_panels":
+        return _launch_wide_addmm(mat1, mat2, bias, out)
+    if tile is not None:
+        return _launch_tiled_gemm(mat1, mat2, out, tile, bias, tuner=addmm_tiled_kernel)
+    if route == "row_vector":
+        with torch_device_fn.device(mat1.device):
+            _addmm_row_vector[(N // 64,)](mat1, mat2, bias, out, N, K)
+        return out
+    if route == "scalar_dot":
+        with torch_device_fn.device(mat1.device):
+            _addmm_scalar_dot[(1,)](mat1, mat2, bias, out, K, triton.next_power_of_2(K))
+        return out
     # Keep row- or column-contiguous views and materialize only general strides.
     if mat1.stride(0) > 1 and mat1.stride(1) > 1:
         mat1 = mat1.contiguous()
     if mat2.stride(0) > 1 and mat2.stride(1) > 1:
         mat2 = mat2.contiguous()
 
-    if (
-        M == N == K
-        and (128 <= N < 512 or N == 1024)
-        and N % 128 == 0
-        and mat1.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and mat1.is_contiguous()
-        and mat2.is_contiguous()
-        and bias.shape == out.shape
-        and bias.is_contiguous()
-        and out.is_contiguous()
-    ):
+    if route == "small_square":
         partial = torch.empty((M, N), dtype=torch.float32, device=mat1.device)
         bm = 64 if N < 512 else 256
         MAX_CORE_DIM = 65535

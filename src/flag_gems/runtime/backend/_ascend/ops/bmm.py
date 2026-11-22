@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from pathlib import Path
 
 import torch
 import triton
@@ -22,71 +23,76 @@ import triton.language.extra.cann.extension as extension
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
-from flag_gems.utils import libentry
+from flag_gems.runtime.backend._ascend.blas_resources import (
+    cube_tile_fits_910b,
+    is_ascend_910b,
+    masked_bias_rhs_fits_910b,
+    vector_tile_fits_910b,
+)
+from flag_gems.runtime.backend._ascend.gemm_tuning import (
+    AscendBlasTuner,
+    ResourcePrunedGemmTuner,
+    _blockified,
+    gemm_dtype_resolver,
+    is_ascend_910c,
+    make_fixed_gemm_tuner,
+    prune_910c_nt_column_tail,
+    tune_fixed_gemm,
+)
+from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as ext
-
-from .mm import _blockified
 
 logger = logging.getLogger(__name__)
 
 
 _BMM_CONFIGS = runtime.get_tuned_config("bmm")
+_BMM_EXPAND_PATH = str(
+    Path(__file__).resolve().parent.parent / "bmm_ascend_expand.yaml"
+)
 
 
 def _prune_bmm_configs(configs, named_args, **kwargs):
-    args = {**named_args, **kwargs}
-    A = args["A"]
-    M, N, K = args["M"], args["N"], args["K"]
-    batch = args["BATCH"]
-    # Keep one balanced tile for small aligned squares with enough programs
-    # to occupy the cores; timing noise otherwise selects padded large tiles.
-    square_programs = batch * (M // 128) * (N // 128)
-    small_square = (
-        A.dtype in (torch.float16, torch.float32, torch.bfloat16)
-        and M == N == K
-        and 256 <= M <= 512
-        and M % 128 == 0
-        and 16 <= square_programs <= 64
-    )
-    short_k_fp16 = (
-        A.dtype == torch.float16
-        and batch == 1
-        and 256 <= M <= 512
-        and N >= 4096
-        and K == 256
-    )
-    target = None
-    if small_square:
-        target = (128, 128, 128)
-    elif short_k_fp16:
-        target = (128, 256, 256)
-    elif A.dtype == torch.bfloat16 and batch == 1 and M >= 256 and K >= 256:
-        if N >= 4096:
-            target = (128, 256, 256)
-        elif N >= 1024 and K >= 4096:
-            target = (256, 128, 256)
-    if target is None:
-        return configs
-
-    selected = [
-        config
-        for config in configs
-        if (
-            config.kwargs["TILE_M"],
-            config.kwargs["TILE_N"],
-            config.kwargs["TILE_K"],
-        )
-        == target
-    ]
-    return selected or configs
+    # Keep only structural constraints: arange extents must be powers of two,
+    # and each A/B/accumulator tile must fit Triton's tensor-element limit.
+    # CANN resource allocation depends on the compiled pipeline; let the
+    # compiler reject resource failures instead of guessing a UB/L0 budget.
+    pruned = []
+    for config in configs:
+        tile_m = config.kwargs["TILE_M"]
+        tile_n = config.kwargs["TILE_N"]
+        tile_k = config.kwargs["TILE_K"]
+        if not all(
+            size > 0 and size & (size - 1) == 0 for size in (tile_m, tile_n, tile_k)
+        ):
+            continue
+        if config.kwargs["GROUP_M"] < 1:
+            continue
+        if max(tile_m * tile_k, tile_k * tile_n, tile_m * tile_n) > 1048576:
+            continue
+        pruned.append(config)
+    if not pruned:
+        raise RuntimeError("No valid BMM configurations after pruning")
+    return pruned
 
 
-# avoid
+class _BMMFlagTuneTuner(ResourcePrunedGemmTuner):
+    default_prune = staticmethod(_prune_bmm_configs)
+
+
 @libentry()
-@triton.autotune(
+@libtuner(
     configs=_BMM_CONFIGS,
     key=["M", "N", "K", "BATCH", "DOT_PAD_ONLY_K"],
-    prune_configs_by={"early_config_prune": _prune_bmm_configs},
+    strategy=["default"] * 5,
+    warmup=5,
+    rep=5,
+    use_cuda_graph=True,
+    flagtune_op_name="bmm",
+    flagtune_expand_op_name="bmm_ascend",
+    flagtune_yaml_path=_BMM_EXPAND_PATH,
+    policy=_BMMFlagTuneTuner,
+    flagtune_op_id="flaggems/bmm",
+    flagtune_variant="batched_gemm",
 )
 @triton.heuristics(_hcu.HEURISTICS_CONFIGS["bmm"])
 @triton.jit
@@ -197,15 +203,19 @@ def bmm(A, B):
     _, _, N = B.shape
     A = A.contiguous()
     out = torch.empty((batch, M, N), dtype=A.dtype, device=A.device)
-    if _use_nt_gemm(A, B):
-        return _launch_nt_gemm(A, B, out)
-    if _use_narrow_gemv(A, B):
-        return _launch_narrow_gemv(A, B, out)
-    if _use_narrow_pack(A, B):
+    route, tile = _select_bmm_route(A, B)
+    if route == "direct_nt":
+        return _launch_nt_gemm(A, B, out, tuner=bmm_tiled_kernel)
+    if route == "direct_nt_tiled":
+        return _launch_tiled_gemm(A, B, out, tile, tuner=bmm_direct_nt_kernel)
+    if route == "column_gemv":
+        return _launch_column_gemv(A, B, out, tuner=bmm_column_gemv_kernel)
+    if route == "narrow_gemv":
+        return _launch_narrow_gemv(A, B, out, tuner=bmm_narrow_gemv_kernel)
+    if route == "packed_rhs":
         return _launch_narrow_pack(A, B, out)
-    tile = _select_rectangular_tile(A, B)
     if tile is not None:
-        return _launch_tiled_gemm(A, B, out, tile)
+        return _launch_tiled_gemm(A, B, out, tile, tuner=bmm_tiled_kernel)
     B = B.contiguous()
     dot_pad_only_k = (
         A.dtype == torch.bfloat16
@@ -237,7 +247,64 @@ def bmm(A, B):
     return out
 
 
+def _select_bmm_route(a, b):
+    if _use_nt_gemm(a, b):
+        return "direct_nt", None
+    if _use_column_gemv(a, b):
+        return "column_gemv", None
+    if _use_narrow_gemv(a, b):
+        return "narrow_gemv", None
+    if _use_narrow_pack(a, b):
+        return "packed_rhs", None
+    tile = _select_rectangular_tile(a, b)
+    if tile is not None:
+        return ("split_k" if tile[3] > 1 else "fixed_tile"), tile
+    tile = _select_direct_nt_tile(a, b)
+    if tile is not None:
+        return "direct_nt_tiled", tile
+    return "batched_gemm", None
+
+
 # Shared Ascend matmul fast paths for addmm, bmm, and baddbmm.
+def _can_use_dense_bf16_gemm(a, b):
+    # Public callers materialize the LHS before dispatching either fast path.
+    m, k = a.shape[-2:]
+    n = b.shape[-1]
+    batch = a.shape[0] if a.ndim == 3 else 1
+    return (
+        a.dtype == b.dtype == torch.bfloat16
+        and a.shape[:-2] == b.shape[:-2]
+        and b.shape[-2] == k
+        and min(batch, m, n, k) > 0
+        and batch * max(m * k, n * k, m * n) < 2**31
+    )
+
+
+def _select_direct_nt_tile(a, b):
+    """Read aligned dense transposed RHS tiles directly from K-contiguous storage."""
+    m, k = a.shape[-2:]
+    n = b.shape[-1]
+    if (
+        n < 4
+        or (n != 4 and n % 16)
+        or k < 128
+        or k % 128
+        or b.is_contiguous()
+        or not b.transpose(-2, -1).is_contiguous()
+        or not _can_use_dense_bf16_gemm(a, b)
+    ):
+        return None
+    batch = a.shape[0] if a.ndim == 3 else 1
+    bm = 16 if m <= 16 else 32 if m <= 64 else 64 if m <= 256 else 128
+    bn = min(256, max(16, triton.next_power_of_2(n)))
+    bk = 128 if k == 128 else 256
+    if n <= 512 and k >= 4096:
+        bm, bn, bk = min(bm, 64), min(bn, 128), 512
+    if batch * triton.cdiv(m, bm) * triton.cdiv(n, bn) > 65535:
+        return None
+    return bm, bn, bk, 1, False
+
+
 def _use_nt_gemm(a, b):
     m, k = a.shape[-2:]
     n = b.shape[-1]
@@ -380,7 +447,106 @@ def _finish_split_gemm(
     tl.store(Out + offset, value, offset < TOTAL)
 
 
-def _launch_tiled_gemm(a, b, out, tile, bias=None):
+_TILED_EXPAND_PATH = str(
+    Path(__file__).resolve().parent.parent / "tiled_gemm_ascend_expand.yaml"
+)
+_TILED_KEY = ["BATCH", "M", "N", "K", "TRANSPOSED", "WITH_BIAS", "HINT"]
+
+
+def _prune_tiled_gemm_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    m, n, k = (args[key] for key in ("M", "N", "K"))
+    batch = args["BATCH"]
+    nt_bf16 = args["TRANSPOSED"] and args["A"].dtype == torch.bfloat16
+    is_910b = is_ascend_910b()
+    prune_nt_tail = nt_bf16 and is_ascend_910c()
+    # A large RHS tile with padding in both axes can fault in the bias path.
+    prune_bias_tail = nt_bf16 and args["WITH_BIAS"]
+    return [
+        c
+        for c in configs
+        if c.kwargs["BM"] * c.kwargs["BN"] <= 32768
+        and batch * triton.cdiv(m, c.kwargs["BM"]) * triton.cdiv(n, c.kwargs["BN"])
+        <= 65535
+        and (not args["HINT"] or k % c.kwargs["BK"] == 0)
+        and not (prune_nt_tail and prune_910c_nt_column_tail(n, c.kwargs["BN"]))
+        and (
+            not is_910b
+            or cube_tile_fits_910b(
+                c.kwargs["BM"],
+                c.kwargs["BN"],
+                c.kwargs["BK"],
+                args["A"].dtype.itemsize,
+                c.num_stages,
+            )
+        )
+        and not (
+            prune_bias_tail
+            and not masked_bias_rhs_fits_910b(
+                n, k, c.kwargs["BN"], c.kwargs["BK"], args["A"].dtype.itemsize
+            )
+        )
+    ]
+
+
+def _prune_direct_nt_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    n, k = args["N"], args["K"]
+    return [
+        config
+        for config in _prune_tiled_gemm_configs(configs, named_args, **kwargs)
+        if k % config.kwargs["BK"] == 0
+        and config.kwargs["BN"] <= min(256, max(16, triton.next_power_of_2(n)))
+        and max(config.kwargs["BM"], config.kwargs["BN"]) * config.kwargs["BK"] <= 65536
+    ]
+
+
+class _TiledGemmTuner(AscendBlasTuner):
+    def _flagtune_configs_for_mode(self, op_name, mode):
+        configs, strategy = super()._flagtune_configs_for_mode(op_name, mode)
+        if mode is runtime.TuningMode.DEFAULT and is_ascend_910b():
+            # The small default tile alone cannot cover narrow NT layouts
+            # and large grids. The fallback tiles are also in Expanded.
+            configs = configs + [
+                triton.Config(dict(BM=bm, BN=bn, BK=bk), num_warps=4, num_stages=1)
+                for bm, bn, bk in (
+                    (16, 16, 64),
+                    (16, 32, 64),
+                    (64, 64, 64),
+                    (128, 128, 128),
+                    (128, 256, 128),
+                )
+            ]
+        return configs, strategy
+
+
+def _make_tiled_tuner(op, variant="tiled_gemm"):
+    prune = (
+        _prune_direct_nt_configs
+        if variant == "direct_nt_tiled"
+        else _prune_tiled_gemm_configs
+    )
+    tuner = libtuner(
+        configs=[triton.Config(dict(BM=16, BN=64, BK=128), num_warps=4, num_stages=2)],
+        key=_TILED_KEY,
+        prune_configs_by={"early_config_prune": prune},
+        use_cuda_graph=True,
+        policy=_TiledGemmTuner,
+        flagtune_op_name=op,
+        flagtune_op_id=f"flaggems/{op}",
+        flagtune_variant=variant,
+        flagtune_expand_op_name="tiled_gemm_ascend",
+        flagtune_yaml_path=_TILED_EXPAND_PATH,
+        flagtune_dtype_resolver=gemm_dtype_resolver(op),
+    )
+    return libentry()(tuner(_tiled_gemm_kernel))
+
+
+bmm_tiled_kernel = _make_tiled_tuner("bmm")
+bmm_direct_nt_kernel = _make_tiled_tuner("bmm", "direct_nt_tiled")
+
+
+def _launch_tiled_gemm(a, b, out, tile, bias=None, *, tuner=None):
     bm, bn, bk, split, hint = tile
     m, k = a.shape[-2:]
     n = b.shape[-1]
@@ -393,9 +559,12 @@ def _launch_tiled_gemm(a, b, out, tile, bias=None):
         else out
     )
     grid = (triton.cdiv(m, bm) * triton.cdiv(n, bn) * split, batch)
+    # The original launcher's preset is the default for these fast paths.
+    # Only opt-in FlagTune or an explicit offline run can replace that preset.
+    tune = split == 1 and tuner is not None and tune_fixed_gemm(tuner)
     with torch_device_fn.device(a.device):
         with _blockified():
-            _tiled_gemm_kernel[grid](
+            launch_args = (
                 a,
                 b,
                 bias_arg,
@@ -407,16 +576,26 @@ def _launch_tiled_gemm(a, b, out, tile, bias=None):
                 k,
                 not b.is_contiguous(),
                 bias is not None,
-                bm,
-                bn,
-                bk,
-                split,
-                hint,
+            )
+            launch_options = dict(
                 multibuffer=True,
                 unit_flag=True,
                 sync_solver=False,
                 enable_auto_blockify=True,
             )
+            if tune:
+
+                def tuned_grid(meta):
+                    return (
+                        triton.cdiv(m, meta["BM"]) * triton.cdiv(n, meta["BN"]),
+                        batch,
+                    )
+
+                tuner[tuned_grid](*launch_args, SPLIT=1, HINT=hint, **launch_options)
+            else:
+                _tiled_gemm_kernel[grid](
+                    *launch_args, bm, bn, bk, split, hint, **launch_options
+                )
         if split > 1:
             _finish_split_gemm[(triton.cdiv(total, 256),)](
                 partial, bias_arg, out, total, split, 256, bias is not None
@@ -424,7 +603,7 @@ def _launch_tiled_gemm(a, b, out, tile, bias=None):
     return out
 
 
-def _launch_nt_gemm(a, b, out, bias=None, block_k=256):
+def _launch_nt_gemm(a, b, out, bias=None, block_k=256, *, tuner=None):
     m = a.shape[-2]
     n = b.shape[-1]
     if m >= 256 and n >= 128 and m % 128 == 0 and n % 128 == 0:
@@ -432,10 +611,10 @@ def _launch_nt_gemm(a, b, out, bias=None, block_k=256):
     else:
         bm = 16 if m <= 64 else 64
         bn = 16 if n <= 16 else 64
-    return _launch_tiled_gemm(a, b, out, (bm, bn, block_k, 1, False), bias)
+    return _launch_tiled_gemm(a, b, out, (bm, bn, block_k, 1, False), bias, tuner=tuner)
 
 
-def _use_narrow_gemv(a, b):
+def _use_narrow_gemv(a, b, *, materialize_rhs=False):
     m, k = a.shape[-2:]
     return (
         a.dtype == b.dtype
@@ -444,12 +623,115 @@ def _use_narrow_gemv(a, b):
         and a.shape[:-2] == b.shape[:-2]
         and (a.ndim == 2 or a.shape[0] > 0)
         and a.is_contiguous()
-        and b.is_contiguous()
+        and (materialize_rhs or b.is_contiguous())
         and m >= 256
         and m % 8 == 0
         and k >= 1024
         and k % 1024 == 0
     )
+
+
+def _column_gemv_tile(batch, m, k):
+    if batch * m >= 1024:
+        return 32, 512
+    if batch * m >= 256 and m >= 16:
+        return 16, 1024
+    return min(8, triton.next_power_of_2(m)), min(2048, triton.next_power_of_2(k))
+
+
+def _use_column_gemv(a, b):
+    m, k = a.shape[-2:]
+    if b.shape[-1] != 1 or not b.is_contiguous() or not _can_use_dense_bf16_gemm(a, b):
+        return False
+    batch = a.shape[0]
+    bm, _ = _column_gemv_tile(batch, m, k)
+    return batch * triton.cdiv(m, bm) <= 65535
+
+
+@triton.jit
+def _column_gemv_kernel(
+    A,
+    B,
+    Bias,
+    Out,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    WITH_BIAS: tl.constexpr,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+    BATCH: tl.constexpr,
+):
+    tiles: tl.constexpr = tl.cdiv(M, BM)
+    pid = tl.program_id(0)
+    batch = pid // tiles
+    rows = pid % tiles * BM + tl.arange(0, BM)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BK), tl.float32)
+    for start in range(tl.cdiv(K, BK)):
+        k = start * BK + rk
+        a = tl.load(
+            A + (batch * M + rows[:, None]) * K + k[None, :],
+            (rows[:, None] < M) & (k[None, :] < K),
+            0,
+        ).to(tl.float32)
+        b = tl.load(B + batch * K + k, k < K, 0).to(tl.float32)
+        acc += a * b[None, :]
+    result = tl.sum(acc, axis=1)
+    offset = batch * M + rows
+    if WITH_BIAS:
+        result += tl.load(Bias + offset, rows < M, 0).to(tl.float32)
+    tl.store(Out + offset, result, rows < M)
+
+
+def _prune_column_gemv(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    is_910b = is_ascend_910b()
+    return [
+        config
+        for config in configs
+        if config.kwargs["BM"] * config.kwargs["BK"] <= 16384
+        and args["BATCH"] * triton.cdiv(args["M"], config.kwargs["BM"]) <= 65535
+        and (
+            not is_910b
+            or vector_tile_fits_910b(
+                config.kwargs["BM"],
+                config.kwargs["BK"],
+                args["A"].dtype.itemsize,
+                config.num_stages,
+            )
+        )
+    ]
+
+
+def _make_column_gemv_tuner(op):
+    return make_fixed_gemm_tuner(
+        _column_gemv_kernel,
+        op,
+        "column_gemv",
+        ["M", "K", "WITH_BIAS", "BATCH"],
+        {"BM": 8, "BK": 1024},
+        _prune_column_gemv,
+        stages=1,
+        dtype_resolver=gemm_dtype_resolver(op),
+    )
+
+
+bmm_column_gemv_kernel = _make_column_gemv_tuner("bmm")
+
+
+def _launch_column_gemv(a, b, out, bias=None, *, tuner):
+    batch, m, k = a.shape
+    bm, bk = _column_gemv_tile(batch, m, k)
+    tiles = triton.cdiv(m, bm)
+    args = (a, b, a if bias is None else bias, out, m, k, bias is not None)
+    with torch_device_fn.device(a.device):
+        if tune_fixed_gemm(tuner):
+            tuner[lambda meta: (batch * triton.cdiv(m, meta["BM"]),)](
+                *args, BATCH=batch
+            )
+        else:
+            _column_gemv_kernel[(batch * tiles,)](*args, bm, bk, batch)
+    return out
 
 
 @triton.jit
@@ -463,6 +745,7 @@ def _narrow_gemv_kernel(
     WITH_BIAS: tl.constexpr,
     BM: tl.constexpr,
     BK: tl.constexpr,
+    BATCH: tl.constexpr = 1,
 ):
     rows = tl.program_id(0) * BM + tl.arange(0, BM)
     batch = tl.program_id(1)
@@ -482,24 +765,67 @@ def _narrow_gemv_kernel(
     tl.store(Out + offset, result)
 
 
-def _launch_narrow_gemv(a, b, out, bias=None):
+def _prune_narrow_gemv(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    m, k, batch = (args[key] for key in ("M", "K", "BATCH"))
+    is_910b = is_ascend_910b()
+    # The original Vector kernel has unmasked loads and uses K // BK.
+    return [
+        cfg
+        for cfg in configs
+        if m % cfg.kwargs["BM"] == 0
+        and k % cfg.kwargs["BK"] == 0
+        and batch * (m // cfg.kwargs["BM"]) <= 65535
+        and (
+            not is_910b
+            or vector_tile_fits_910b(
+                cfg.kwargs["BM"],
+                cfg.kwargs["BK"],
+                args["A"].dtype.itemsize,
+                cfg.num_stages,
+            )
+        )
+    ]
+
+
+def _make_narrow_gemv_tuner(op):
+    # BATCH is launch metadata for tuning and keeps different batch sizes
+    # distinct in the LibEntry cache. The kernel grid handles the batch itself.
+    return make_fixed_gemm_tuner(
+        _narrow_gemv_kernel,
+        op,
+        "narrow_gemv",
+        ["M", "K", "WITH_BIAS", "BATCH"],
+        {"BM": 8, "BK": 1024},
+        _prune_narrow_gemv,
+        stages=1,
+        dtype_resolver=gemm_dtype_resolver(op),
+    )
+
+
+bmm_narrow_gemv_kernel = _make_narrow_gemv_tuner("bmm")
+
+
+def _launch_narrow_gemv(a, b, out, bias=None, *, tuner):
     m, k = a.shape[-2:]
     batch = a.shape[0] if a.ndim == 3 else 1
+    args = (a, b, a if bias is None else bias, out, m, k, bias is not None)
     with torch_device_fn.device(a.device):
-        _narrow_gemv_kernel[(m // 8, batch)](
-            a, b, a if bias is None else bias, out, m, k, bias is not None, 8, 1024
-        )
+        if tune_fixed_gemm(tuner):
+            tuner[lambda meta: (m // meta["BM"], batch)](*args, BATCH=batch)
+        else:
+            _narrow_gemv_kernel[(m // 8, batch)](*args, 8, 1024)
     return out
 
 
-def _use_narrow_pack(a, b):
+def _use_narrow_pack(a, b, *, materialize_rhs=False):
     m, k = a.shape[-2:]
     n = b.shape[-1]
     return (
         a.dtype == b.dtype
         and a.dtype in (torch.float16, torch.bfloat16)
         and a.is_contiguous()
-        and b.is_contiguous()
+        and (materialize_rhs or b.is_contiguous())
         and a.shape[:-2] == b.shape[:-2]
         and (a.ndim == 2 or a.shape[0] > 0)
         and b.shape[-2] == k

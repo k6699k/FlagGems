@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from pathlib import Path
 
 import torch
 import triton
@@ -23,15 +24,25 @@ from flag_gems import runtime
 from flag_gems.ops.mul import mul
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
-from flag_gems.utils import libentry
+from flag_gems.runtime.backend._ascend.gemm_tuning import (
+    ResourcePrunedGemmTuner,
+    prune_910c_baddbmm_short_k,
+)
+from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as tle
 
 from .bmm import (
+    _launch_column_gemv,
     _launch_narrow_gemv,
     _launch_narrow_pack,
     _launch_nt_gemm,
     _launch_tiled_gemm,
+    _make_column_gemv_tuner,
+    _make_narrow_gemv_tuner,
+    _make_tiled_tuner,
+    _select_direct_nt_tile,
     _select_rectangular_tile,
+    _use_column_gemv,
     _use_narrow_gemv,
     _use_narrow_pack,
     _use_nt_gemm,
@@ -39,12 +50,30 @@ from .bmm import (
 )
 
 logger = logging.getLogger(__name__)
+baddbmm_tiled_kernel = _make_tiled_tuner("baddbmm")
+baddbmm_direct_nt_kernel = _make_tiled_tuner("baddbmm", "direct_nt_tiled")
+baddbmm_column_gemv_kernel = _make_column_gemv_tuner("baddbmm")
+baddbmm_narrow_gemv_kernel = _make_narrow_gemv_tuner("baddbmm")
 
 
 _BADDBMM_CONFIGS = runtime.get_tuned_config("baddbmm")
+_BADDBMM_EXPAND_PATH = str(
+    Path(__file__).resolve().parent.parent / "baddbmm_ascend_expand.yaml"
+)
 
 
 def _prune_baddbmm_configs(configs, named_args, **kwargs):
+    if len(configs) > len(_BADDBMM_CONFIGS):
+        return [
+            c
+            for c in configs
+            if max(
+                c.kwargs["TILE_M"] * c.kwargs["TILE_N"],
+                c.kwargs["TILE_M"] * c.kwargs["TILE_K"],
+                c.kwargs["TILE_N"] * c.kwargs["TILE_K"],
+            )
+            <= 1048576
+        ]
     args = {**named_args, **kwargs}
     A = args["A"]
     M, N, K = args["M"], args["N"], args["K"]
@@ -97,11 +126,34 @@ def _broadcast_strides(tensor, shape):
     return tuple(strides)
 
 
+class _BaddBMMFlagTuneTuner(ResourcePrunedGemmTuner):
+    default_prune = staticmethod(_prune_baddbmm_configs)
+    prune_910c_bf16 = staticmethod(prune_910c_baddbmm_short_k)
+
+
 @libentry()
-@triton.autotune(
+@libtuner(
     configs=_BADDBMM_CONFIGS,
-    key=["M", "N", "K", "DOT_PAD_ONLY_K", "BIAS_IS_VECTOR"],
-    prune_configs_by={"early_config_prune": _prune_baddbmm_configs},
+    key=[
+        "M",
+        "N",
+        "K",
+        "BATCH",
+        "DOT_PAD_ONLY_K",
+        "BIAS_IS_VECTOR",
+        "bias_batch_stride",
+        "bias_M_stride",
+        "bias_N_stride",
+    ],
+    warmup=5,
+    rep=5,
+    use_cuda_graph=True,
+    flagtune_op_name="baddbmm",
+    flagtune_expand_op_name="baddbmm_ascend",
+    flagtune_yaml_path=_BADDBMM_EXPAND_PATH,
+    flagtune_op_id="flaggems/baddbmm",
+    flagtune_variant="batched_gemm",
+    policy=_BaddBMMFlagTuneTuner,
 )
 @triton.heuristics(_hcu.HEURISTICS_CONFIGS["baddbmm"])
 @triton.jit(do_not_specialize=["alpha", "beta"])
@@ -115,6 +167,7 @@ def baddbmm_kernel(
     M,
     N,
     K,
+    BATCH: tl.constexpr,
     TILE_M: tl.constexpr,
     TILE_N: tl.constexpr,
     TILE_K: tl.constexpr,
@@ -128,99 +181,96 @@ def baddbmm_kernel(
     bias_M_stride: tl.constexpr,
     bias_N_stride: tl.constexpr,
 ):
-    # batch offsets
-    pid_b = tle.program_id(2)
-    A += pid_b * M * K
-    B += pid_b * K * N
-    O += pid_b * M * N
-    bias += pid_b * bias_batch_stride
+    grid_m = tl.cdiv(M, TILE_M)
+    grid_n = tl.cdiv(N, TILE_N)
+    logical_tiles = grid_m * grid_n * BATCH
+    for program in range(tle.program_id(0), logical_tiles, tle.num_programs(0)):
+        pid_b = program // (grid_m * grid_n)
+        pid = program % (grid_m * grid_n)
+        A += pid_b * M * K
+        B += pid_b * K * N
+        O += pid_b * M * N
+        bias += pid_b * bias_batch_stride
 
-    pidx = tle.program_id(0)
-    pidy = tle.program_id(1)
-
-    if GROUP_M == 1:
-        pid_m, pid_n = pidx, pidy
-    else:
-        gridx = tle.num_programs(0)
-        gridy = tle.num_programs(1)
-        pid = pidx + pidy * gridx
-        num_CTA_per_group = gridy * GROUP_M
-        group_id = pid // num_CTA_per_group
-        inner_group_id = pid % num_CTA_per_group
-        GROUP_SIZE = tl.where(
-            (group_id * GROUP_M + GROUP_M) > gridx, gridx % GROUP_M, GROUP_M
-        )
-        pid_m = group_id * GROUP_M + inner_group_id % GROUP_SIZE
-        pid_n = inner_group_id // GROUP_SIZE
-
-    offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
-    offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
-    offs_k = tl.arange(0, TILE_K)
-
-    if not DIVISIBLE_M:
-        mask_m = offs_m < M
-    if not DIVISIBLE_N:
-        mask_n = offs_n < N
-
-    a_ptrs = A + offs_m[:, None] * K + offs_k[None, :]
-    b_ptrs = B + offs_k[:, None] * N + offs_n[None, :]
-    o_ptrs = O + offs_m[:, None] * N + offs_n[None, :]
-
-    num_iters = tl.cdiv(K, TILE_K)
-    accumulator = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
-    for _ in range(num_iters):
-        if DIVISIBLE_K:
-            if DIVISIBLE_M:
-                mask_a = None
-            else:
-                mask_a = mask_m[:, None]
-            if DIVISIBLE_N:
-                mask_b = None
-            else:
-                mask_b = mask_n[None, :]
+        if GROUP_M == 1:
+            pid_m = pid % grid_m
+            pid_n = pid // grid_m
         else:
-            mask_k = offs_k < K
-            if DIVISIBLE_M:
-                mask_a = mask_k[None, :]
-            else:
-                mask_a = mask_m[:, None] & mask_k[None, :]
-            if DIVISIBLE_N:
-                mask_b = mask_k[:, None]
-            else:
-                mask_b = mask_k[:, None] & mask_n[None, :]
-        a = tl.load(a_ptrs, mask=mask_a)
-        b = tl.load(b_ptrs, mask=mask_b)
-        if DOT_PAD_ONLY_K:
-            extension.compile_hint(a, "dot_pad_only_k")
-            extension.compile_hint(b, "dot_pad_only_k")
-        accumulator += tl.dot(a, b, allow_tf32=False)
-        offs_k += TILE_K
-        a_ptrs += TILE_K
-        b_ptrs += TILE_K * N
+            width = grid_n * GROUP_M
+            group_id = pid // width
+            inner_id = pid % width
+            group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+            pid_m = group_id * GROUP_M + inner_id % group_size
+            pid_n = inner_id // group_size
 
-    if DIVISIBLE_M and DIVISIBLE_N:
-        mask_c = None
-    else:
-        mask_c = True
+        offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
+        offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
+        offs_k = tl.arange(0, TILE_K)
+
         if not DIVISIBLE_M:
-            mask_c &= offs_m[:, None] < M
+            mask_m = offs_m < M
         if not DIVISIBLE_N:
-            mask_c &= offs_n[None, :] < N
+            mask_n = offs_n < N
 
-    if BIAS_IS_VECTOR:
-        bias_ptrs = bias + offs_n * bias_N_stride
-        if DIVISIBLE_N:
-            bi = tl.load(bias_ptrs)[None, :]
+        a_ptrs = A + offs_m[:, None] * K + offs_k[None, :]
+        b_ptrs = B + offs_k[:, None] * N + offs_n[None, :]
+        o_ptrs = O + offs_m[:, None] * N + offs_n[None, :]
+
+        num_iters = tl.cdiv(K, TILE_K)
+        accumulator = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
+        for _ in range(num_iters):
+            if DIVISIBLE_K:
+                if DIVISIBLE_M:
+                    mask_a = None
+                else:
+                    mask_a = mask_m[:, None]
+                if DIVISIBLE_N:
+                    mask_b = None
+                else:
+                    mask_b = mask_n[None, :]
+            else:
+                mask_k = offs_k < K
+                if DIVISIBLE_M:
+                    mask_a = mask_k[None, :]
+                else:
+                    mask_a = mask_m[:, None] & mask_k[None, :]
+                if DIVISIBLE_N:
+                    mask_b = mask_k[:, None]
+                else:
+                    mask_b = mask_k[:, None] & mask_n[None, :]
+            a = tl.load(a_ptrs, mask=mask_a)
+            b = tl.load(b_ptrs, mask=mask_b)
+            if DOT_PAD_ONLY_K:
+                extension.compile_hint(a, "dot_pad_only_k")
+                extension.compile_hint(b, "dot_pad_only_k")
+            accumulator += tl.dot(a, b, allow_tf32=False)
+            offs_k += TILE_K
+            a_ptrs += TILE_K
+            b_ptrs += TILE_K * N
+
+        if DIVISIBLE_M and DIVISIBLE_N:
+            mask_c = None
         else:
-            bi = tl.load(bias_ptrs, mask=offs_n < N, other=0.0)[None, :]
-    else:
-        bias_ptrs = (
-            bias + offs_m[:, None] * bias_M_stride + offs_n[None, :] * bias_N_stride
-        )
-        bi = tl.load(bias_ptrs, mask=mask_c)
-    out = accumulator * alpha + bi * beta
-    o = out.to(bi.dtype)
-    tl.store(o_ptrs, o, mask=mask_c)
+            mask_c = True
+            if not DIVISIBLE_M:
+                mask_c &= offs_m[:, None] < M
+            if not DIVISIBLE_N:
+                mask_c &= offs_n[None, :] < N
+
+        if BIAS_IS_VECTOR:
+            bias_ptrs = bias + offs_n * bias_N_stride
+            if DIVISIBLE_N:
+                bi = tl.load(bias_ptrs)[None, :]
+            else:
+                bi = tl.load(bias_ptrs, mask=offs_n < N, other=0.0)[None, :]
+        else:
+            bias_ptrs = (
+                bias + offs_m[:, None] * bias_M_stride + offs_n[None, :] * bias_N_stride
+            )
+            bi = tl.load(bias_ptrs, mask=mask_c)
+        out = accumulator * alpha + bi * beta
+        o = out.to(bi.dtype)
+        tl.store(o_ptrs, o, mask=mask_c)
 
 
 def _dense_forward_tile(a, b):
@@ -246,6 +296,33 @@ def _dense_forward_tile(a, b):
     return None
 
 
+def _select_baddbmm_route(bias, a, b, *, alpha=1, beta=1):
+    batch, m, _ = a.shape
+    n = b.shape[-1]
+    if not (
+        alpha == beta == 1
+        and bias.shape == (batch, m, n)
+        and bias.dtype == a.dtype
+        and bias.is_contiguous()
+    ):
+        return "batched_gemm", None
+    if _use_nt_gemm(a, b):
+        return "direct_nt", None
+    tile = _dense_forward_tile(a, b)
+    if tile is not None:
+        return ("split_k" if tile[3] > 1 else "fixed_tile"), tile
+    if _use_column_gemv(a, b):
+        return "column_gemv", None
+    if _use_narrow_gemv(a, b, materialize_rhs=True):
+        return "narrow_gemv", None
+    if _use_narrow_pack(a, b, materialize_rhs=True):
+        return "packed_rhs", None
+    tile = _select_direct_nt_tile(a, b)
+    if tile is not None:
+        return "direct_nt_tiled", tile
+    return "batched_gemm", None
+
+
 class BaddbmmFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, bias, A, B, beta, alpha):
@@ -254,28 +331,31 @@ class BaddbmmFunction(torch.autograd.Function):
         batch, M, K = A.shape
         _, _, N = B.shape
         A = A.contiguous()
-        dense_bias = (
-            alpha == beta == 1
-            and bias.shape == (batch, M, N)
-            and bias.dtype == A.dtype
-            and bias.is_contiguous()
-        )
-        nt_gemm = dense_bias and _use_nt_gemm(A, B)
-        tile = _dense_forward_tile(A, B) if dense_bias and not nt_gemm else None
-        if not nt_gemm and tile is None:
+        route, tile = _select_baddbmm_route(bias, A, B, alpha=alpha, beta=beta)
+        if route != "direct_nt" and tile is None:
             B = B.contiguous()
 
         ctx.save_for_backward(A, B, bias)
         ctx.alpha = alpha
         ctx.beta = beta
         out = torch.empty((batch, M, N), dtype=A.dtype, device=A.device)
-        if nt_gemm:
-            return _launch_nt_gemm(A, B, out, bias)
+        if route == "direct_nt":
+            return _launch_nt_gemm(A, B, out, bias, tuner=baddbmm_tiled_kernel)
+        if route == "direct_nt_tiled":
+            return _launch_tiled_gemm(
+                A, B, out, tile, bias, tuner=baddbmm_direct_nt_kernel
+            )
+        if route == "column_gemv":
+            return _launch_column_gemv(
+                A, B, out, bias, tuner=baddbmm_column_gemv_kernel
+            )
         if tile is not None:
-            return _launch_tiled_gemm(A, B, out, tile, bias)
-        if dense_bias and _use_narrow_gemv(A, B):
-            return _launch_narrow_gemv(A, B, out, bias)
-        if dense_bias and _use_narrow_pack(A, B):
+            return _launch_tiled_gemm(A, B, out, tile, bias, tuner=baddbmm_tiled_kernel)
+        if route == "narrow_gemv":
+            return _launch_narrow_gemv(
+                A, B, out, bias, tuner=baddbmm_narrow_gemv_kernel
+            )
+        if route == "packed_rhs":
             return _launch_narrow_pack(A, B, out, bias)
 
         bias_batch_stride, bias_M_stride, bias_N_stride = _broadcast_strides(
@@ -292,9 +372,10 @@ class BaddbmmFunction(torch.autograd.Function):
         )
 
         grid = lambda meta: (
-            triton.cdiv(meta["M"], meta["TILE_M"]),
-            triton.cdiv(meta["N"], meta["TILE_N"]),
-            batch,
+            min(
+                triton.cdiv(M, meta["TILE_M"]) * triton.cdiv(N, meta["TILE_N"]) * batch,
+                65535,
+            ),
         )
         with torch_device_fn.device(A.device):
             baddbmm_kernel[grid](
@@ -307,11 +388,13 @@ class BaddbmmFunction(torch.autograd.Function):
                 M,
                 N,
                 K,
+                BATCH=batch,
                 bias_batch_stride=bias_batch_stride,
                 bias_M_stride=bias_M_stride,
                 bias_N_stride=bias_N_stride,
                 DOT_PAD_ONLY_K=dot_pad_only_k,
                 BIAS_IS_VECTOR=bias_is_vector,
+                enable_auto_blockify=False,
             )
         return out
 

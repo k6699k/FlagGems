@@ -1,0 +1,200 @@
+schema_version: 3
+op_id: flaggems/mm
+pretune:
+  shape:
+    fields:
+      M: {type: int, min: 1}
+      N: {type: int, min: 1}
+      K: {type: int, min: 1}
+      B_layout:
+        type: str
+        default: {literal: contiguous}
+        choices: [contiguous, transposed_2d]
+      Count: {type: int, required: false, min: 0, role: count}
+    identity: [M, N, K, B_layout]
+  dispatch: {policy: first_match, order: [ascend_gemm, rectangular, narrow_gemv, packed_narrow, wide_panels, large_panels, packed_narrow_nt, direct_nt_tiled]}
+  benchmark:
+    tensors:
+      a: {factory: randn, shape: [M, K], dtype: runtime}
+      b: {factory: randn, shape: [K, N], dtype: runtime, layout: B_layout}
+    invoke: {kind: flag_gems_public, args: [a, b]}
+variants:
+  ascend_gemm:
+    inputs:
+      M: {min: 1}
+      N: {min: 1}
+      K: {min: 1}
+    when: {op: gt, args: [M, 0]}
+    params:
+      BLOCK_M: {values: [16, 32, 64, 128, 256]}
+      BLOCK_N: {values: [32, 64, 128, 256]}
+      BLOCK_K: {values: [32, 64, 128, 256, 512, 1024]}
+      SPLIT_K: {values: [1]}
+      num_stages: {values: [1, 2, 3]}
+      num_warps: {values: [4]}
+    features:
+      - {name: M, op: ident, args: [M]}
+      - {name: N, op: ident, args: [N]}
+      - {name: K, op: ident, args: [K]}
+      - {name: BLOCK_M, op: ident, args: [BLOCK_M]}
+      - {name: BLOCK_N, op: ident, args: [BLOCK_N]}
+      - {name: BLOCK_K, op: ident, args: [BLOCK_K]}
+      - {name: SPLIT_K, op: ident, args: [SPLIT_K]}
+      - {name: num_stages, op: ident, args: [num_stages]}
+      - {name: num_warps, op: ident, args: [num_warps]}
+      - {name: grid_m, op: cdiv, args: [M, BLOCK_M]}
+      - {name: grid_n, op: cdiv, args: [N, BLOCK_N]}
+      - {name: grid, op: mul, args: [grid_m, grid_n]}
+      - {name: k_iterations, op: cdiv, args: [K, BLOCK_K]}
+      - {name: a_tile, op: mul, args: [BLOCK_M, BLOCK_K]}
+      - {name: b_tile, op: mul, args: [BLOCK_N, BLOCK_K]}
+      - {name: c_tile, op: mul, args: [BLOCK_M, BLOCK_N]}
+      - {name: tail_m, op: mod, args: [M, BLOCK_M]}
+      - {name: tail_n, op: mod, args: [N, BLOCK_N]}
+      - {name: tail_k, op: mod, args: [K, BLOCK_K]}
+  rectangular:
+    inputs:
+      M: {min: 1}
+      N: {min: 1}
+      K: {min: 1}
+    when: {op: gt, args: [M, 0]}
+    params:
+      BLOCK_M: {values: [16, 32, 64, 128]}
+      BLOCK_N: {values: [32, 64, 128, 256]}
+      BLOCK_K: {values: [64, 128, 256]}
+      num_stages: {values: [1, 2]}
+      num_warps: {values: [4]}
+    features:
+      - {name: M, op: ident, args: [M]}
+      - {name: N, op: ident, args: [N]}
+      - {name: K, op: ident, args: [K]}
+      - {name: BLOCK_M, op: ident, args: [BLOCK_M]}
+      - {name: BLOCK_N, op: ident, args: [BLOCK_N]}
+      - {name: BLOCK_K, op: ident, args: [BLOCK_K]}
+      - {name: num_stages, op: ident, args: [num_stages]}
+      - {name: num_warps, op: ident, args: [num_warps]}
+      - {name: grid_m, op: cdiv, args: [M, BLOCK_M]}
+      - {name: grid_n, op: cdiv, args: [N, BLOCK_N]}
+      - {name: k_iterations, op: cdiv, args: [K, BLOCK_K]}
+      - {name: c_tile, op: mul, args: [BLOCK_M, BLOCK_N]}
+  narrow_gemv:
+    inputs:
+      M: {min: 1}
+      K: {min: 1}
+    when: {op: gt, args: [M, 0]}
+    params:
+      BLOCK_OUT: {values: [1, 2, 4, 8, 16]}
+      BLOCK_K: {values: [128, 256, 512, 1024, 2048]}
+      num_stages: {values: [1]}
+      num_warps: {values: [4]}
+    features:
+      - {name: M, op: ident, args: [M]}
+      - {name: K, op: ident, args: [K]}
+      - {name: BLOCK_OUT, op: ident, args: [BLOCK_OUT]}
+      - {name: BLOCK_K, op: ident, args: [BLOCK_K]}
+      - {name: num_stages, op: ident, args: [num_stages]}
+      - {name: num_warps, op: ident, args: [num_warps]}
+      - {name: grid_m, op: cdiv, args: [M, BLOCK_OUT]}
+      - {name: k_iterations, op: cdiv, args: [K, BLOCK_K]}
+      - {name: a_tile, op: mul, args: [BLOCK_OUT, BLOCK_K]}
+  packed_narrow: &packed_narrow
+    inputs:
+      M: {min: 1}
+      N: {min: 1}
+      K: {min: 1}
+    when: {op: gt, args: [M, 0]}
+    params:
+      BM: {values: [16, 32, 64, 128]}
+      BK: {values: [128, 256, 512, 1024]}
+      num_stages: {values: [1, 2]}
+      num_warps: {values: [4]}
+    features:
+      - {name: M, op: ident, args: [M]}
+      - {name: N, op: ident, args: [N]}
+      - {name: K, op: ident, args: [K]}
+      - {name: BM, op: ident, args: [BM]}
+      - {name: BK, op: ident, args: [BK]}
+      - {name: num_stages, op: ident, args: [num_stages]}
+      - {name: num_warps, op: ident, args: [num_warps]}
+      - {name: grid_m, op: cdiv, args: [M, BM]}
+      - {name: k_iterations, op: cdiv, args: [K, BK]}
+      - {name: a_tile, op: mul, args: [BM, BK]}
+  wide_panels:
+    inputs:
+      M: {min: 1}
+      N: {min: 1}
+      K: {min: 1}
+    when: {op: gt, args: [M, 0]}
+    params:
+      BM: {values: [16, 32, 64, 128]}
+      BK: {values: [64, 128, 256]}
+      num_stages: {values: [1, 2]}
+      num_warps: {values: [4]}
+    features:
+      - {name: M, op: ident, args: [M]}
+      - {name: N, op: ident, args: [N]}
+      - {name: K, op: ident, args: [K]}
+      - {name: BM, op: ident, args: [BM]}
+      - {name: BK, op: ident, args: [BK]}
+      - {name: num_stages, op: ident, args: [num_stages]}
+      - {name: num_warps, op: ident, args: [num_warps]}
+      - {name: grid_m, op: cdiv, args: [M, BM]}
+      - {name: k_iterations, op: cdiv, args: [K, BK]}
+      - {name: a_tile, op: mul, args: [BM, BK]}
+  large_panels:
+    inputs:
+      M: {min: 1}
+      N: {min: 1}
+      K: {min: 1}
+    when: {op: gt, args: [M, 0]}
+    params:
+      BM: {values: [16, 32, 64, 128]}
+      BK: {values: [64, 128, 256]}
+      num_stages: {values: [1, 2]}
+      num_warps: {values: [4]}
+    features:
+      - {name: M, op: ident, args: [M]}
+      - {name: N, op: ident, args: [N]}
+      - {name: K, op: ident, args: [K]}
+      - {name: BM, op: ident, args: [BM]}
+      - {name: BK, op: ident, args: [BK]}
+      - {name: num_stages, op: ident, args: [num_stages]}
+      - {name: num_warps, op: ident, args: [num_warps]}
+      - {name: grid_m, op: cdiv, args: [M, BM]}
+      - {name: k_iterations, op: cdiv, args: [K, BK]}
+      - {name: a_tile, op: mul, args: [BM, BK]}
+
+  packed_narrow_nt: *packed_narrow
+  direct_nt_tiled:
+    inputs:
+      BATCH: {default: 1, min: 1}
+      M: {min: 1}
+      N: {min: 1}
+      K: {min: 1}
+      TRANSPOSED: {default: 0, min: 0, max: 1}
+      WITH_BIAS: {default: 0, min: 0, max: 1}
+      HINT: {default: 0, min: 0, max: 1}
+    when: {op: gt, args: [M, 0]}
+    params:
+      BM: {values: [16, 32, 64, 128, 256]}
+      BN: {values: [16, 32, 64, 128, 256, 512]}
+      BK: {values: [64, 128, 256, 512]}
+      num_stages: {values: [1, 2]}
+      num_warps: {values: [4]}
+    features:
+      - {name: BATCH, op: ident, args: [BATCH]}
+      - {name: M, op: ident, args: [M]}
+      - {name: N, op: ident, args: [N]}
+      - {name: K, op: ident, args: [K]}
+      - {name: TRANSPOSED, op: ident, args: [TRANSPOSED]}
+      - {name: WITH_BIAS, op: ident, args: [WITH_BIAS]}
+      - {name: HINT, op: ident, args: [HINT]}
+      - {name: BM, op: ident, args: [BM]}
+      - {name: BN, op: ident, args: [BN]}
+      - {name: BK, op: ident, args: [BK]}
+      - {name: num_stages, op: ident, args: [num_stages]}
+      - {name: num_warps, op: ident, args: [num_warps]}
+      - {name: grid_m, op: cdiv, args: [M, BM]}
+      - {name: grid_n, op: cdiv, args: [N, BN]}
+      - {name: k_iterations, op: cdiv, args: [K, BK]}
+      - {name: output_tile, op: mul, args: [BM, BN]}

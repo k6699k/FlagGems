@@ -401,13 +401,52 @@ class Benchmark:
             end = time.time()
             latency = (end - start) / n_rep * 1000
         elif Config.mode == consts.BenchMode.CUDAGRAPH:
-            do_bench_cudagraph = triton.testing.do_bench_cudagraph
-            latency = do_bench_cudagraph(
-                fn,
-                rep=Config.repetition,
-                return_mode="median",
-                grad_to_none=xs if self.is_backward else None,
-            )
+            if vendor_name == "ascend":
+                import statistics
+
+                stream = torch_device_fn.Stream()
+                stream.wait_stream(torch_device_fn.current_stream())
+                with torch_device_fn.stream(stream):
+                    fn()
+                    start = torch_device_fn.Event(enable_timing=True)
+                    end = torch_device_fn.Event(enable_timing=True)
+                    start.record()
+                    for _ in range(5):
+                        fn()
+                    end.record()
+                    torch_device_fn.synchronize()
+                    estimate = start.elapsed_time(end) / 5
+                    repeats = (
+                        1000
+                        if estimate == 0
+                        else max(1, int(Config.repetition / estimate))
+                    )
+                    graph = torch_device_fn.NPUGraph()
+                    with torch_device_fn.graph(graph, stream=stream):
+                        for _ in range(repeats):
+                            if xs is not None:
+                                for x in xs:
+                                    x.grad = None
+                            fn()
+                    torch_device_fn.synchronize()
+                    samples = []
+                    for _ in range(10):
+                        start.record()
+                        graph.replay()
+                        end.record()
+                        torch_device_fn.synchronize()
+                        samples.append(start.elapsed_time(end) / repeats)
+                    graph.reset()
+                torch_device_fn.current_stream().wait_stream(stream)
+                latency = statistics.median(samples)
+            else:
+                do_bench_cudagraph = triton.testing.do_bench_cudagraph
+                latency = do_bench_cudagraph(
+                    fn,
+                    rep=Config.repetition,
+                    return_mode="median",
+                    grad_to_none=xs if self.is_backward else None,
+                )
         else:
             raise ValueError("Undefined Value of Benchmark Mode.")
         # average latency in ms

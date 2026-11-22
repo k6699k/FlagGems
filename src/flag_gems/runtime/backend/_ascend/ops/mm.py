@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import logging
-import os
+from pathlib import Path
 
 import torch
 import triton
@@ -24,24 +23,30 @@ import triton.language.extra.cann.extension as al
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
+from flag_gems.runtime.backend._ascend.blas_resources import (
+    cube_tile_fits_910b,
+    is_ascend_910b,
+    prune_cube_tiles_910b,
+    vector_tile_fits_910b,
+)
+from flag_gems.runtime.backend._ascend.gemm_tuning import (
+    AscendBlasTuner,
+    _blockified,
+    launch_panel_gemm,
+    make_fixed_gemm_tuner,
+    prune_panel_gemm,
+    tune_fixed_gemm,
+)
 from flag_gems.utils import libentry, libtuner
+from flag_gems.utils.libentry import LibTunerRunMode
 
+from .bmm import _launch_tiled_gemm, _make_tiled_tuner, _select_direct_nt_tile
 from .copy import copy as copy_tensor
 
 logger = logging.getLogger(__name__)
-
-
-@contextlib.contextmanager
-def _blockified():
-    previous = os.environ.get("TRITON_ALL_BLOCKS_PARALLEL")
-    os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
-        else:
-            os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = previous
+EXPAND_CONFIG_FILENAME = str(
+    Path(__file__).resolve().parent.parent / "mm_ascend_expand.yaml"
+)
 
 
 def _prune_mm_configs(configs, named_args, **kwargs):
@@ -64,13 +69,14 @@ def _prune_mm_configs(configs, named_args, **kwargs):
             return preferred
     large_aligned = min(m, n) >= 1024 and m % 128 == 0 and n % 128 == 0
     if not large_aligned:
-        configs = [
+        compact = [
             config
             for config in configs
             if config.kwargs["BLOCK_M"] <= 128
             and config.kwargs["BLOCK_N"] <= 128
             and config.kwargs["BLOCK_K"] <= 256
         ]
+        configs = compact or configs
     program_counts = {
         id(config): triton.cdiv(m, config.kwargs["BLOCK_M"])
         * triton.cdiv(n, config.kwargs["BLOCK_N"])
@@ -125,6 +131,54 @@ def _prune_mm_configs(configs, named_args, **kwargs):
     return candidates
 
 
+class _MMFlagTuneTuner(AscendBlasTuner):
+    def __init__(self, *args, **kwargs):
+        kwargs["prune_configs_by"] = {"early_config_prune": self._prune_candidates}
+        super().__init__(*args, **kwargs)
+
+    def _prune_candidates(self, configs, named_args, **kwargs):
+        args = {**named_args, **kwargs}
+        if is_ascend_910b():
+            # The kernel iterates over logical tiles with a capped launch grid.
+            valid = prune_cube_tiles_910b(
+                (c for c in configs if c.kwargs.get("SPLIT_K", 1) == 1),
+                args["A"].dtype,
+                ("BLOCK_M", "BLOCK_N", "BLOCK_K"),
+            )
+            if (
+                self._flagtune_mode is runtime.TuningMode.DEFAULT
+                and self._run_mode is not LibTunerRunMode.EXHAUSTIVE_COLLECTION
+            ):
+                return _prune_mm_configs(valid, named_args, **kwargs)
+            return valid
+        if (
+            self._flagtune_mode is runtime.TuningMode.DEFAULT
+            and getattr(self, "_run_mode", None)
+            is not LibTunerRunMode.EXHAUSTIVE_COLLECTION
+        ):
+            return _prune_mm_configs(configs, named_args, **kwargs)
+
+        m, n = args["M"], args["N"]
+        target = triton.runtime.driver.active.get_current_target()
+        is_910c = str(target.arch).startswith("Ascend910_93")
+        valid = []
+        for config in configs:
+            bm = config.kwargs["BLOCK_M"]
+            bn = config.kwargs["BLOCK_N"]
+            # The public kernel writes directly to the output. Split-K needs
+            # a separately initialized accumulator before it can be enabled.
+            if config.kwargs.get("SPLIT_K", 1) != 1:
+                continue
+            if triton.cdiv(m, bm) * triton.cdiv(n, bn) > 65535:
+                continue
+            # A single Cube tile holds a full FP32 accumulator. On 910C
+            # its 128 KiB C buffer can hold at most 32768 FP32 values.
+            if is_910c and bm * bn > 32768:
+                continue
+            valid.append(config)
+        return valid
+
+
 def _mm_heur_divisible_m(args):
     return args["M"] % args["BLOCK_M"] == 0
 
@@ -158,7 +212,13 @@ _MM_HEURISTICS = {
 @libtuner(
     configs=runtime.get_tuned_config("mm"),
     key=["M", "N", "K"],
-    prune_configs_by={"early_config_prune": _prune_mm_configs},
+    use_cuda_graph=True,
+    policy=_MMFlagTuneTuner,
+    flagtune_op_name="mm",
+    flagtune_expand_op_name="mm_ascend",
+    flagtune_op_id="flaggems/mm",
+    flagtune_variant="ascend_gemm",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
 )
 @triton.heuristics(_MM_HEURISTICS)
 @triton.jit
@@ -711,6 +771,146 @@ def _mm_persistent_smallk_kernel(
         )
 
 
+def _prune_mm_rectangular(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    if is_ascend_910b():
+        return prune_cube_tiles_910b(
+            configs, args["A"].dtype, ("BLOCK_M", "BLOCK_N", "BLOCK_K")
+        )
+    m, n = args["M"], args["N"]
+    return [
+        cfg
+        for cfg in configs
+        if triton.cdiv(m, cfg.kwargs["BLOCK_M"]) * triton.cdiv(n, cfg.kwargs["BLOCK_N"])
+        <= 65535
+    ]
+
+
+def _prune_mm_packed_narrow(configs, named_args, **kwargs):
+    if is_ascend_910b():
+        args = {**named_args, **kwargs}
+        return [
+            cfg
+            for cfg in configs
+            if cube_tile_fits_910b(
+                cfg.kwargs["BM"],
+                16,
+                cfg.kwargs["BK"],
+                args["A"].dtype.itemsize,
+                cfg.num_stages,
+            )
+        ]
+    m = named_args["M"]
+    return [cfg for cfg in configs if triton.cdiv(m, cfg.kwargs["BM"]) <= 65535]
+
+
+def _prune_mm_narrow_gemv(configs, named_args, **kwargs):
+    if is_ascend_910b():
+        args = {**named_args, **kwargs}
+        return [
+            cfg
+            for cfg in configs
+            if vector_tile_fits_910b(
+                cfg.kwargs["BLOCK_OUT"],
+                cfg.kwargs["BLOCK_K"],
+                args["A"].dtype.itemsize,
+                cfg.num_stages,
+            )
+        ]
+    m = named_args["M"]
+    return [cfg for cfg in configs if triton.cdiv(m, cfg.kwargs["BLOCK_OUT"]) <= 65535]
+
+
+mm_rectangular_kernel = make_fixed_gemm_tuner(
+    _mm_rectangular_kernel.fn,
+    "mm",
+    "rectangular",
+    ["M", "N", "K"],
+    {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 256},
+    _prune_mm_rectangular,
+    space="mm_rectangular",
+)
+mm_narrow_gemv_kernel = make_fixed_gemm_tuner(
+    _mm_narrow_n_kernel.fn,
+    "mm",
+    "narrow_gemv",
+    ["M", "K"],
+    {"BLOCK_OUT": 4, "BLOCK_K": 1024},
+    _prune_mm_narrow_gemv,
+    space="mm_narrow_gemv",
+    stages=1,
+)
+mm_packed_narrow_kernel = make_fixed_gemm_tuner(
+    _mm_packed_narrow_kernel,
+    "mm",
+    "packed_narrow",
+    ["M", "N", "K"],
+    {"BM": 64, "BK": 512},
+    _prune_mm_packed_narrow,
+    space="mm_packed_narrow",
+)
+mm_packed_narrow_nt_kernel = make_fixed_gemm_tuner(
+    _mm_packed_narrow_kernel,
+    "mm",
+    "packed_narrow_nt",
+    ["M", "N", "K"],
+    {"BM": 16, "BK": 512},
+    _prune_mm_packed_narrow,
+    space="mm_packed_narrow",
+)
+mm_direct_nt_kernel = _make_tiled_tuner("mm", "direct_nt_tiled")
+mm_wide_panel_kernel = make_fixed_gemm_tuner(
+    _mm_wide_panel_cube_kernel,
+    "mm",
+    "wide_panels",
+    ["M", "N", "K"],
+    {"BM": 128, "BK": 128},
+    prune_panel_gemm,
+    space="panel_gemm",
+)
+mm_large_panel_kernel = make_fixed_gemm_tuner(
+    _mm_large_panel_cube_kernel,
+    "mm",
+    "large_panels",
+    ["M", "N", "K"],
+    {"BM": 128, "BK": 256},
+    prune_panel_gemm,
+    space="panel_gemm",
+)
+
+
+def _launch_mm_packed_narrow(a, packed, out, bm, bk, *, tuner=mm_packed_narrow_kernel):
+    m, k = a.shape
+    n = out.shape[1]
+    options = dict(multibuffer=True, unit_flag=True, sync_solver=False)
+    if tune_fixed_gemm(tuner):
+        tuner[lambda meta: _mm_capped_grid(triton.cdiv(m, meta["BM"]))](
+            a, packed, out, m, n, k, **options
+        )
+    else:
+        _mm_packed_narrow_kernel[_mm_capped_grid(triton.cdiv(m, bm))](
+            a, packed, out, m, n, k, bm, bk, **options
+        )
+
+
+def _launch_mm_rectangular(a, b, out, bm, bn, bk):
+    m, k = a.shape
+    n = b.shape[1]
+    options = dict(multibuffer=True, unit_flag=True, sync_solver=False)
+    if tune_fixed_gemm(mm_rectangular_kernel):
+
+        def grid(meta):
+            return _mm_capped_grid(
+                triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"])
+            )
+
+        mm_rectangular_kernel[grid](a, b, out, m, n, k, **options)
+    else:
+        _mm_rectangular_kernel[
+            _mm_capped_grid(triton.cdiv(m, bm) * triton.cdiv(n, bn))
+        ](a, b, out, m, n, k, bm, bn, bk, **options)
+
+
 def get_higher_dtype(a, b):
     if a is b:
         return a
@@ -821,6 +1021,98 @@ def _mm_nn_rectangular_tile(m, n, k):
     return None
 
 
+def _select_mm_route(a, b):
+    """Select the public MM route for the operand shapes and RHS layout."""
+    M, K = a.shape
+    N = b.shape[1]
+    if (
+        a.dtype == b.dtype
+        and a.dtype in (torch.float16, torch.bfloat16)
+        and N == 16
+        and 2048 <= K <= 4096
+        and K % 1024 == 0
+    ):
+        return "packed_narrow_nt" if b.T.is_contiguous() else "packed_narrow16"
+    if (
+        a.dtype == b.dtype
+        and a.dtype in (torch.float16, torch.bfloat16)
+        and N == 4
+        and 8192 < K <= 16384
+        and K % 512 == 0
+    ):
+        return "packed_narrow_nt" if b.T.is_contiguous() else "packed_narrow4"
+    nt_route = _select_mm_nt_route(a, b)
+    if _select_direct_nt_tile(a, b) is not None and (
+        nt_route != "nt_split" or tune_fixed_gemm(mm_direct_nt_kernel)
+    ):
+        return "direct_nt_tiled"
+    if nt_route is not None:
+        return nt_route
+    if (
+        a.dtype == b.dtype
+        and a.dtype in (torch.float16, torch.bfloat16)
+        and N >= 131072
+        and N % 256 == 0
+        and 1024 < K <= 2048
+        and K % 128 == 0
+        and 0 < M <= 128
+    ):
+        return "wide_panels"
+    if (
+        a.dtype == b.dtype == torch.bfloat16
+        and K % 256 == 0
+        and (
+            (15360 < M <= 16384 and 2048 < N <= 2304 and 4096 < K <= 8192)
+            or (1024 < M <= 2048 and N >= 131072 and 1024 < K <= 2048)
+            or (
+                1024 < M <= 2048
+                and 8192 < N <= 32768
+                and N % 256 != 0
+                and 2048 < K <= 8192
+            )
+        )
+    ):
+        return "large_panels"
+    if a.dtype == b.dtype == torch.bfloat16 and (M, N, K) == (480, 4096, 128):
+        return "persistent_smallk"
+    if a.dtype == b.dtype == torch.bfloat16 and (
+        (6144 < N <= 7168 and K == 256 and M > 128)
+        or (M, N, K)
+        in (
+            (200, 7168, 2304),
+            (13422, 256, 2048),
+            (480, 4608, 7168),
+        )
+    ):
+        return "rectangular_bf16"
+    if a.dtype == b.dtype == torch.bfloat16 and (M, N, K) in (
+        (1, 64, 4096),
+        (6, 64, 4096),
+        (16, 64, 2048),
+        (4434, 2048, 1024),
+        (1352, 3072, 2048),
+        (80, 12288, 2048),
+        (368, 3072, 2048),
+    ):
+        return "rectangular_fixed"
+    if (
+        a.dtype == b.dtype == torch.bfloat16
+        and b.is_contiguous()
+        and _mm_nn_rectangular_tile(M, N, K) is not None
+    ):
+        return "rectangular_fixed"
+    if M <= 16 and N <= 16 and K < 128:
+        return "tiny_reduction"
+    if K < 128:
+        return "short_reduction"
+    if a.dtype == b.dtype and a.dtype in (torch.float16, torch.bfloat16) and K >= 128:
+        if N == 1:
+            return "narrow_gemv"
+        if M <= 32 and N >= 16384:
+            return "rectangular_wide"
+    return "ascend_gemm"
+
+
 def mm(a, b):
     logger.debug("GEMS_ASCEND MM")
     device = a.device
@@ -839,23 +1131,31 @@ def mm(a, b):
             b = _mm_materialize_broadcast(b)
     if not a.is_contiguous():
         a = a.contiguous()
-    route = _select_mm_nt_route(a, b)
-    if route is not None:
-        return _launch_mm_nt(a, b, route)
-    if not b.is_contiguous():
-        b = b.contiguous()
     M, K = a.shape
     _, N = b.shape
+    route = _select_mm_route(a, b)
+    if route in ("nt_split", "nt_dense"):
+        return _launch_mm_nt(a, b, route)
+    if route == "direct_nt_tiled":
+        c = torch.empty((M, N), device=device, dtype=a.dtype)
+        return _launch_tiled_gemm(
+            a, b, c, _select_direct_nt_tile(a, b), tuner=mm_direct_nt_kernel
+        )
+    if route == "packed_narrow_nt":
+        # The NT operand is already stored in the format used by the Cube kernel.
+        bm = 64 if N == 16 and M >= 4096 else 16
+        bk = 1024 if N == 16 else 512
+        c = torch.empty((M, N), device=device, dtype=a.dtype)
+        with torch_device_fn.device(device), _blockified():
+            _launch_mm_packed_narrow(
+                a, b.T, c, bm, bk, tuner=mm_packed_narrow_nt_kernel
+            )
+        return c
+    # Other kernels require row-major or explicitly packed operands.
+    if not b.is_contiguous():
+        b = b.contiguous()
     # Pack the narrow right operand once so Cube reads contiguous K rows.
-    if (
-        a.dtype == b.dtype
-        and a.dtype in (torch.float16, torch.bfloat16)
-        and N == 16
-        and 2048 <= K <= 4096
-        and K % 1024 == 0
-        and a.is_contiguous()
-        and b.is_contiguous()
-    ):
+    if route == "packed_narrow16":
         block_m = 64 if M >= 4096 else 16
         c = torch.empty((M, N), device=device, dtype=a.dtype)
         packed_b = torch.empty((N, K), device=device, dtype=b.dtype)
@@ -869,30 +1169,10 @@ def mm(a, b):
                 16,
                 multibuffer=False,
             )
-            _mm_packed_narrow_kernel[_mm_capped_grid(triton.cdiv(M, block_m))](
-                a,
-                packed_b,
-                c,
-                M,
-                N,
-                K,
-                block_m,
-                1024,
-                multibuffer=True,
-                unit_flag=True,
-                sync_solver=False,
-            )
+            _launch_mm_packed_narrow(a, packed_b, c, block_m, 1024)
         return c
     # Deinterleave four BF16 columns into contiguous K vectors for Cube.
-    if (
-        a.dtype == b.dtype
-        and a.dtype in (torch.float16, torch.bfloat16)
-        and N == 4
-        and 8192 < K <= 16384
-        and K % 512 == 0
-        and a.is_contiguous()
-        and b.is_contiguous()
-    ):
+    if route == "packed_narrow4":
         c = torch.empty((M, N), device=device, dtype=a.dtype)
         packed_b = torch.empty((4, K), device=device, dtype=b.dtype)
         with torch_device_fn.device(device), _blockified():
@@ -903,33 +1183,11 @@ def mm(a, b):
                 512,
                 multibuffer=False,
             )
-            _mm_packed_narrow_kernel[_mm_capped_grid(triton.cdiv(M, 16))](
-                a,
-                packed_b,
-                c,
-                M,
-                N,
-                K,
-                16,
-                512,
-                multibuffer=True,
-                unit_flag=True,
-                sync_solver=False,
-            )
+            _launch_mm_packed_narrow(a, packed_b, c, 16, 512)
         return c
     # For the very wide BF16 layout, pack B into contiguous N panels so that
     # Cube reads short contiguous rows instead of the original K-strided rows.
-    if (
-        a.dtype == b.dtype
-        and a.dtype in (torch.float16, torch.bfloat16)
-        and N >= 131072
-        and N % 256 == 0
-        and 1024 < K <= 2048
-        and K % 128 == 0
-        and 0 < M <= 128
-        and a.is_contiguous()
-        and b.is_contiguous()
-    ):
+    if route == "wide_panels":
         block_m = 16 if M <= 16 else 128
         block_n = 256
         c = torch.empty((M, N), device=device, dtype=a.dtype)
@@ -938,41 +1196,18 @@ def mm(a, b):
             _mm_pack_wide_panels_kernel[_mm_capped_grid(N // block_n * (K // 64))](
                 b, packed_b, N, K, block_n, 64, multibuffer=False
             )
-            _mm_wide_panel_cube_kernel[
-                _mm_capped_grid(triton.cdiv(M, block_m) * (N // block_n))
-            ](
-                a,
-                packed_b,
-                c,
-                M,
-                N,
-                K,
+            launch_panel_gemm(
+                _mm_wide_panel_cube_kernel,
+                mm_wide_panel_kernel,
+                (a, packed_b, c),
+                (M, N, K),
                 block_m,
-                block_n,
                 128,
-                multibuffer=True,
-                unit_flag=True,
-                sync_solver=False,
             )
         return c
     # Panel families: tall/narrow outputs and wide outputs with a large
     # reduction. K alignment is required by the unmasked panel kernels.
-    if (
-        a.dtype == b.dtype == torch.bfloat16
-        and K % 256 == 0
-        and (
-            (15360 < M <= 16384 and 2048 < N <= 2304 and 4096 < K <= 8192)
-            or (1024 < M <= 2048 and N >= 131072 and 1024 < K <= 2048)
-            or (
-                1024 < M <= 2048
-                and 8192 < N <= 32768
-                and N % 256 != 0
-                and 2048 < K <= 8192
-            )
-        )
-        and a.is_contiguous()
-        and b.is_contiguous()
-    ):
+    if route == "large_panels":
         c = torch.empty((M, N), device=device, dtype=a.dtype)
         packed_b = torch.empty(
             (triton.cdiv(N, 256), K, 256), device=device, dtype=b.dtype
@@ -989,32 +1224,19 @@ def mm(a, b):
                 64,
                 multibuffer=False,
             )
-            _mm_large_panel_cube_kernel[
-                _mm_capped_grid(triton.cdiv(M, 128) * triton.cdiv(N, 256))
-            ](
-                a,
-                packed_b,
-                c,
-                M,
-                N,
-                K,
+            launch_panel_gemm(
+                _mm_large_panel_cube_kernel,
+                mm_large_panel_kernel,
+                (a, packed_b, c),
+                (M, N, K),
                 128,
                 256,
-                256,
-                multibuffer=True,
-                unit_flag=True,
-                sync_solver=False,
             )
         return c
     # Compatibility exceptions: nearby shapes use the generic path in the
     # established workload. Keep their dispatch until wider ranges are measured.
     # Four M tiles per program keep this 64-tile workload balanced over 16 cores.
-    if (
-        a.dtype == b.dtype == torch.bfloat16
-        and (M, N, K) == (480, 4096, 128)
-        and a.is_contiguous()
-        and b.is_contiguous()
-    ):
+    if route == "persistent_smallk":
         c = torch.empty((M, N), device=device, dtype=a.dtype)
         with torch_device_fn.device(device), _blockified():
             _mm_persistent_smallk_kernel[(16,)](
@@ -1033,75 +1255,19 @@ def mm(a, b):
             )
         return c
     # Wider N tiles reduce program count and K-loop overhead on these layouts.
-    if (
-        a.dtype == b.dtype == torch.bfloat16
-        and a.is_contiguous()
-        and b.is_contiguous()
-        and (
-            (6144 < N <= 7168 and K == 256 and M > 128)
-            or (M, N, K)
-            in (
-                (200, 7168, 2304),
-                (13422, 256, 2048),
-                (480, 4608, 7168),
-            )
-        )
-    ):
+    if route == "rectangular_bf16":
         c = torch.empty((M, N), device=device, dtype=a.dtype)
         with torch_device_fn.device(device), _blockified():
-            _mm_rectangular_kernel[
-                _mm_capped_grid(triton.cdiv(M, 128) * triton.cdiv(N, 256))
-            ](
-                a,
-                b,
-                c,
-                M,
-                N,
-                K,
-                128,
-                256,
-                min(256, K),
-                multibuffer=True,
-                unit_flag=True,
-                sync_solver=False,
-            )
+            _launch_mm_rectangular(a, b, c, 128, 256, min(256, K))
         return c
     # Explicit tiles for narrow outputs and the remaining slow rectangular layouts.
-    if (
-        a.dtype == b.dtype == torch.bfloat16
-        and a.is_contiguous()
-        and b.is_contiguous()
-        and (M, N, K)
-        in (
-            (1, 64, 4096),
-            (6, 64, 4096),
-            (16, 64, 2048),
-            (4434, 2048, 1024),
-            (1352, 3072, 2048),
-            (80, 12288, 2048),
-            (368, 3072, 2048),
-        )
-    ):
-        bm = 16 if M <= 16 else 128
-        bn = 64 if N == 64 else 256
+    if route == "rectangular_fixed":
+        tile = _mm_nn_rectangular_tile(M, N, K)
+        if tile is None:
+            tile = (16 if M <= 16 else 128, 64 if N == 64 else 256, 256)
         c = torch.empty((M, N), device=device, dtype=a.dtype)
         with torch_device_fn.device(device), _blockified():
-            _mm_rectangular_kernel[
-                _mm_capped_grid(triton.cdiv(M, bm) * triton.cdiv(N, bn))
-            ](
-                a,
-                b,
-                c,
-                M,
-                N,
-                K,
-                bm,
-                bn,
-                256,
-                multibuffer=True,
-                unit_flag=True,
-                sync_solver=False,
-            )
+            _launch_mm_rectangular(a, b, c, *tile)
         return c
     # allocates output
     c_dtype = get_higher_dtype(a.dtype, b.dtype)
@@ -1110,7 +1276,7 @@ def mm(a, b):
 
     # Keep tiny reductions off the autotuned Cube path. Some Ascend
     # toolchains select an invalid tile for these partial shapes.
-    if M <= 16 and N <= 16 and K < 128:
+    if route == "tiny_reduction":
         if not a.is_contiguous():
             a = a.contiguous()
         if not b.is_contiguous():
@@ -1136,7 +1302,7 @@ def mm(a, b):
 
     # Keep all short reductions off the autotuned Cube path. Some Ascend
     # toolchains select an invalid tile for partial K tiles.
-    if K < 128:
+    if route == "short_reduction":
         block_m = 16 if M <= 16 else 128
         block_n = 32 if N <= 32 else (128 if N <= 128 else 256)
         with torch_device_fn.device(device), _blockified():
@@ -1158,15 +1324,13 @@ def mm(a, b):
             )
         return c
 
-    if (
-        a.dtype == b.dtype
-        and a.dtype in (torch.float16, torch.bfloat16)
-        and a.is_contiguous()
-        and b.is_contiguous()
-        and K >= 128
-    ):
-        if N == 1:
-            with torch_device_fn.device(device):
+    if route == "narrow_gemv":
+        with torch_device_fn.device(device):
+            if tune_fixed_gemm(mm_narrow_gemv_kernel):
+                mm_narrow_gemv_kernel[
+                    lambda meta: _mm_capped_grid(triton.cdiv(M, meta["BLOCK_OUT"]))
+                ](a, b, c, M, N, K)
+            else:
                 _mm_narrow_n_kernel[_mm_capped_grid(triton.cdiv(M, 4))](
                     a,
                     b,
@@ -1177,49 +1341,13 @@ def mm(a, b):
                     BLOCK_OUT=4,
                     BLOCK_K=min(2048, triton.next_power_of_2(K)),
                 )
-            return c
-        tile = _mm_nn_rectangular_tile(M, N, K) if a.dtype == torch.bfloat16 else None
-        if tile is not None:
-            block_m, block_n, block_k = tile
-            with torch_device_fn.device(device), _blockified():
-                _mm_rectangular_kernel[
-                    _mm_capped_grid(triton.cdiv(M, block_m) * triton.cdiv(N, block_n))
-                ](
-                    a,
-                    b,
-                    c,
-                    M,
-                    N,
-                    K,
-                    block_m,
-                    block_n,
-                    block_k,
-                    multibuffer=True,
-                    unit_flag=True,
-                    sync_solver=False,
-                )
-            return c
-        if M <= 32 and N >= 16384:
-            block_m = 16 if M <= 16 else 32
-            block_n = 256
-            with torch_device_fn.device(device), _blockified():
-                _mm_rectangular_kernel[
-                    _mm_capped_grid(triton.cdiv(M, block_m) * triton.cdiv(N, block_n))
-                ](
-                    a,
-                    b,
-                    c,
-                    M,
-                    N,
-                    K,
-                    BLOCK_M=block_m,
-                    BLOCK_N=block_n,
-                    BLOCK_K=256,
-                    multibuffer=True,
-                    unit_flag=True,
-                    sync_solver=False,
-                )
-            return c
+        return c
+    if route == "rectangular_wide":
+        block_m = 16 if M <= 16 else 32
+        block_n = 256
+        with torch_device_fn.device(device), _blockified():
+            _launch_mm_rectangular(a, b, c, block_m, block_n, 256)
+        return c
 
     # launch kernel
     grid = lambda META: _mm_grid(M, N, META)
