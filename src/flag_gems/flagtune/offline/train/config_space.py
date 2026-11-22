@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Optional
 
 _MM_RUNTIME_OPS = {
@@ -145,9 +146,11 @@ def runtime_configs_for_variant(
         "narrow_gemv_ascend",
         "panel_gemm_ascend",
     }:
-        from flag_gems.runtime.backend._ascend.gemm_tuning import FIXED_GEMM_EXPAND_PATH
+        from flag_gems.runtime.backend import _ascend
 
-        expand_yaml_path = FIXED_GEMM_EXPAND_PATH
+        expand_yaml_path = str(
+            Path(_ascend.__file__).with_name("fixed_gemm_ascend_expand.yaml")
+        )
     if (
         expand_yaml_path is None
         and platform_name == "ascend"

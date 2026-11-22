@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import logging
+import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -23,24 +25,9 @@ import triton.language.extra.cann.extension as extension
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
-from flag_gems.runtime.backend._ascend.blas_resources import (
-    cube_tile_fits_910b,
-    is_ascend_910b,
-    masked_bias_rhs_fits_910b,
-    vector_tile_fits_910b,
-)
-from flag_gems.runtime.backend._ascend.gemm_tuning import (
-    AscendBlasTuner,
-    ResourcePrunedGemmTuner,
-    _blockified,
-    gemm_dtype_resolver,
-    is_ascend_910c,
-    make_fixed_gemm_tuner,
-    prune_910c_nt_column_tail,
-    tune_fixed_gemm,
-)
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as ext
+from flag_gems.utils.libentry import LibTuner, LibTunerRunMode
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +36,105 @@ _BMM_CONFIGS = runtime.get_tuned_config("bmm")
 _BMM_EXPAND_PATH = str(
     Path(__file__).resolve().parent.parent / "bmm_ascend_expand.yaml"
 )
+FIXED_GEMM_EXPAND_PATH = str(
+    Path(__file__).parent.parent / "fixed_gemm_ascend_expand.yaml"
+)
+
+# CANN 9.1 platform_config/Ascend910B4-1.ini, AICoreSpec.
+_L0B_BYTES = 64 * 1024
+_L0C_BYTES = 128 * 1024
+_L1_BYTES = 512 * 1024
+_UB_BYTES = 192 * 1024
+_FP32_BYTES = 4
+
+
+def is_ascend_910b():
+    arch = triton.runtime.driver.active.get_current_target().arch
+    # The bare Ascend910B target uses AIC-100 and different memory sizes.
+    return str(arch).startswith(
+        ("Ascend910B1", "Ascend910B2", "Ascend910B3", "Ascend910B4")
+    )
+
+
+def is_ascend_910c():
+    target = triton.runtime.driver.active.get_current_target()
+    return str(target.arch).startswith("Ascend910_93")
+
+
+def cube_tile_fits_910b(bm, bn, bk, element_bytes, stages):
+    """Conservatively budget the FP32 accumulator and staged L1 input panels."""
+    # CANN can subdivide the L1 panels when issuing L0A/L0B loads.
+    return (
+        bm * bn * _FP32_BYTES <= _L0C_BYTES
+        and (bm + bn) * bk * element_bytes * max(stages, 1) <= _L1_BYTES
+    )
+
+
+def prune_cube_tiles_910b(configs, dtype, names):
+    return [
+        config
+        for config in configs
+        if cube_tile_fits_910b(
+            *(config.kwargs[name] for name in names),
+            dtype.itemsize,
+            config.num_stages,
+        )
+    ]
+
+
+def vector_tile_fits_910b(rows, reduction, element_bytes, stages):
+    """Budget FP32 working tiles and staged inputs in Unified Buffer."""
+    staged_bytes = max(stages, 1) * element_bytes
+    matrix_bytes = rows * reduction * (2 * _FP32_BYTES + staged_bytes)
+    vector_bytes = reduction * (_FP32_BYTES + staged_bytes) + rows * _FP32_BYTES
+    return matrix_bytes + vector_bytes <= _UB_BYTES
+
+
+class AscendBlasTuner(LibTuner.get("flagtune")):
+    def get_key(self, args):
+        key = super().get_key(args)
+        if is_ascend_910b():
+            # Rerank old cache entries under the 910B rules. Exact dimensions
+            # matter for padding and launch limits even with a bucketed strategy.
+            key += (
+                "ascend910b_blas_resources_v1",
+                *(args[k] for k in self.keys if k in args),
+            )
+        return key
+
+
+@contextmanager
+def _blockified():
+    key = "TRITON_ALL_BLOCKS_PARALLEL"
+    previous = os.environ.get(key)
+    os.environ[key] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
+def tune_fixed_gemm(tuner):
+    # Keep the upstream preset until tuning is selected or requested offline.
+    return (
+        tuner.fn._run_mode is not LibTunerRunMode.NORMAL
+        or runtime.flagtune_enabled(tuner.fn._flagtune_op_name)
+        or runtime.resolve_cost_model_intent(supports_cost_model=True)
+        is runtime.CostModelIntent.REQUIRED
+    )
+
+
+def gemm_dtype_resolver(op, rhs="B"):
+    """Match the public input/output dtype order and omit scratch pointers."""
+    names = ("A", rhs, "Out") if op in {"mm", "bmm"} else ("Bias", "A", rhs, "Out")
+
+    def resolve(arguments):
+        return tuple(arguments[name].dtype for name in names)
+
+    return resolve
 
 
 def _prune_bmm_configs(configs, named_args, **kwargs):
@@ -73,6 +159,60 @@ def _prune_bmm_configs(configs, named_args, **kwargs):
     if not pruned:
         raise RuntimeError("No valid BMM configurations after pruning")
     return pruned
+
+
+class ResourcePrunedGemmTuner(AscendBlasTuner):
+    """Use hardware constraints for search and the existing policy for Default."""
+
+    tile_prefix = "TILE"
+    prune_910c_bf16 = None
+
+    def __init__(self, *args, **kwargs):
+        kwargs["prune_configs_by"] = {"early_config_prune": self._prune_candidates}
+        super().__init__(*args, **kwargs)
+
+    def _prune_candidates(self, configs, named_args, **kwargs):
+        args = {**named_args, **kwargs}
+        is_910b = is_ascend_910b()
+        names = tuple(f"{self.tile_prefix}_{axis}" for axis in ("M", "N", "K"))
+        if (
+            self._flagtune_mode is runtime.TuningMode.DEFAULT
+            and getattr(self, "_run_mode", None)
+            is not LibTunerRunMode.EXHAUSTIVE_COLLECTION
+        ):
+            preferred = self.default_prune(configs, named_args, **kwargs)
+            if not is_910b:
+                return preferred
+            dtype = args["A"].dtype
+            return prune_cube_tiles_910b(
+                preferred, dtype, names
+            ) or prune_cube_tiles_910b(configs, dtype, names)
+
+        is_910c = is_ascend_910c()
+        prune = self.prune_910c_bf16 if is_910c else None
+        if prune is not None:
+            if args["A"].dtype != torch.bfloat16:
+                prune = None
+        valid = []
+        for config in configs:
+            meta = config.kwargs
+            bm, bn, bk = (meta[name] for name in names)
+            if not all(tile > 0 and tile & (tile - 1) == 0 for tile in (bm, bn, bk)):
+                continue
+            if meta.get("GROUP_M", 1) < 1 or meta.get("SPLIT_K", 1) != 1:
+                continue
+            if max(bm * bn, bm * bk, bn * bk) > 1048576:
+                continue
+            if is_910c and bm * bn > 32768:
+                continue
+            if is_910b and not cube_tile_fits_910b(
+                bm, bn, bk, args["A"].dtype.itemsize, config.num_stages
+            ):
+                continue
+            if prune is not None and prune(args["K"], bk, config.num_stages):
+                continue
+            valid.append(config)
+        return valid
 
 
 class _BMMFlagTuneTuner(ResourcePrunedGemmTuner):
@@ -451,6 +591,24 @@ _TILED_EXPAND_PATH = str(
     Path(__file__).resolve().parent.parent / "tiled_gemm_ascend_expand.yaml"
 )
 _TILED_KEY = ["BATCH", "M", "N", "K", "TRANSPOSED", "WITH_BIAS", "HINT"]
+_NT_BIAS_TAIL_MAX_BK_910B = 128
+
+
+def prune_910c_nt_column_tail(n, bn):
+    """Reject wide masked column tiles for BF16 transposed RHS on 910C."""
+    return bn >= 512 and n % bn != 0
+
+
+def _nt_bias_tail_tile_fits_910b(n, bn, bk):
+    # BF16 NT GEMM with fused bias can stall on 910B when a wide reduction
+    # tile is combined with a masked column tail.
+    return n % bn == 0 or bk <= _NT_BIAS_TAIL_MAX_BK_910B
+
+
+def masked_bias_rhs_fits_910b(n, k, bn, bk, element_bytes):
+    """Leave room for padding when a transposed BF16 RHS has two masked axes."""
+    # A full L0B-sized tile with this layout stalled the bias kernel on 910B4-1.
+    return n % bn == 0 or k >= bk or bn * bk * element_bytes < _L0B_BYTES
 
 
 def _prune_tiled_gemm_configs(configs, named_args, **kwargs):
@@ -470,6 +628,10 @@ def _prune_tiled_gemm_configs(configs, named_args, **kwargs):
         <= 65535
         and (not args["HINT"] or k % c.kwargs["BK"] == 0)
         and not (prune_nt_tail and prune_910c_nt_column_tail(n, c.kwargs["BN"]))
+        and (
+            not (is_910b and prune_bias_tail)
+            or _nt_bias_tail_tile_fits_910b(n, c.kwargs["BN"], c.kwargs["BK"])
+        )
         and (
             not is_910b
             or cube_tile_fits_910b(
@@ -502,6 +664,18 @@ def _prune_direct_nt_configs(configs, named_args, **kwargs):
 
 
 class _TiledGemmTuner(AscendBlasTuner):
+    def get_key(self, args):
+        key = super().get_key(args)
+        if (
+            args["TRANSPOSED"]
+            and args["WITH_BIAS"]
+            and args["A"].dtype == torch.bfloat16
+            and is_ascend_910b()
+        ):
+            # Cached winners from the old search space can bypass pruning.
+            return (*key, "ascend910b_nt_bias_tail_v1")
+        return key
+
     def _flagtune_configs_for_mode(self, op_name, mode):
         configs, strategy = super()._flagtune_configs_for_mode(op_name, mode)
         if mode is runtime.TuningMode.DEFAULT and is_ascend_910b():
@@ -520,30 +694,30 @@ class _TiledGemmTuner(AscendBlasTuner):
         return configs, strategy
 
 
-def _make_tiled_tuner(op, variant="tiled_gemm"):
-    prune = (
-        _prune_direct_nt_configs
-        if variant == "direct_nt_tiled"
-        else _prune_tiled_gemm_configs
+def _make_bmm_tiled_tuner(variant, prune):
+    return libentry()(
+        libtuner(
+            configs=[
+                triton.Config(dict(BM=16, BN=64, BK=128), num_warps=4, num_stages=2)
+            ],
+            key=_TILED_KEY,
+            prune_configs_by={"early_config_prune": prune},
+            use_cuda_graph=True,
+            policy=_TiledGemmTuner,
+            flagtune_op_name="bmm",
+            flagtune_op_id="flaggems/bmm",
+            flagtune_variant=variant,
+            flagtune_expand_op_name="tiled_gemm_ascend",
+            flagtune_yaml_path=_TILED_EXPAND_PATH,
+            flagtune_dtype_resolver=gemm_dtype_resolver("bmm"),
+        )(_tiled_gemm_kernel)
     )
-    tuner = libtuner(
-        configs=[triton.Config(dict(BM=16, BN=64, BK=128), num_warps=4, num_stages=2)],
-        key=_TILED_KEY,
-        prune_configs_by={"early_config_prune": prune},
-        use_cuda_graph=True,
-        policy=_TiledGemmTuner,
-        flagtune_op_name=op,
-        flagtune_op_id=f"flaggems/{op}",
-        flagtune_variant=variant,
-        flagtune_expand_op_name="tiled_gemm_ascend",
-        flagtune_yaml_path=_TILED_EXPAND_PATH,
-        flagtune_dtype_resolver=gemm_dtype_resolver(op),
-    )
-    return libentry()(tuner(_tiled_gemm_kernel))
 
 
-bmm_tiled_kernel = _make_tiled_tuner("bmm")
-bmm_direct_nt_kernel = _make_tiled_tuner("bmm", "direct_nt_tiled")
+bmm_tiled_kernel = _make_bmm_tiled_tuner("tiled_gemm", _prune_tiled_gemm_configs)
+bmm_direct_nt_kernel = _make_bmm_tiled_tuner(
+    "direct_nt_tiled", _prune_direct_nt_configs
+)
 
 
 def _launch_tiled_gemm(a, b, out, tile, bias=None, *, tuner=None):
@@ -552,6 +726,8 @@ def _launch_tiled_gemm(a, b, out, tile, bias=None, *, tuner=None):
     n = b.shape[-1]
     batch = a.shape[0] if a.ndim == 3 else 1
     total = batch * m * n
+    transposed = not b.is_contiguous()
+    with_bias = bias is not None
     bias_arg = a if bias is None else bias
     partial = (
         torch.empty((split, total), device=a.device, dtype=torch.float32)
@@ -574,8 +750,8 @@ def _launch_tiled_gemm(a, b, out, tile, bias=None, *, tuner=None):
                 m,
                 n,
                 k,
-                not b.is_contiguous(),
-                bias is not None,
+                transposed,
+                with_bias,
             )
             launch_options = dict(
                 multibuffer=True,
@@ -593,6 +769,15 @@ def _launch_tiled_gemm(a, b, out, tile, bias=None, *, tuner=None):
 
                 tuner[tuned_grid](*launch_args, SPLIT=1, HINT=hint, **launch_options)
             else:
+                if (
+                    split == 1
+                    and with_bias
+                    and transposed
+                    and a.dtype == torch.bfloat16
+                    and not _nt_bias_tail_tile_fits_910b(n, bn, bk)
+                    and is_ascend_910b()
+                ):
+                    bk = _NT_BIAS_TAIL_MAX_BK_910B
                 _tiled_gemm_kernel[grid](
                     *launch_args, bm, bn, bk, split, hint, **launch_options
                 )
@@ -703,20 +888,29 @@ def _prune_column_gemv(configs, named_args, **kwargs):
     ]
 
 
-def _make_column_gemv_tuner(op):
-    return make_fixed_gemm_tuner(
-        _column_gemv_kernel,
-        op,
-        "column_gemv",
-        ["M", "K", "WITH_BIAS", "BATCH"],
-        {"BM": 8, "BK": 1024},
-        _prune_column_gemv,
-        stages=1,
-        dtype_resolver=gemm_dtype_resolver(op),
+def _make_bmm_gemv_tuner(kernel, variant, prune):
+    # BATCH is launch metadata and keeps distinct batch sizes in the tuning key.
+    return libentry()(
+        libtuner(
+            configs=[triton.Config({"BM": 8, "BK": 1024}, num_warps=4, num_stages=1)],
+            key=["M", "K", "WITH_BIAS", "BATCH"],
+            prune_configs_by={"early_config_prune": prune},
+            use_cuda_graph=True,
+            policy=AscendBlasTuner,
+            flagtune_op_name="bmm",
+            flagtune_op_id="flaggems/bmm",
+            flagtune_variant=variant,
+            flagtune_expand_op_name=f"{variant}_ascend",
+            flagtune_yaml_path=FIXED_GEMM_EXPAND_PATH,
+            flagtune_dtype_resolver=gemm_dtype_resolver("bmm"),
+            disable_aabs=True,
+        )(kernel)
     )
 
 
-bmm_column_gemv_kernel = _make_column_gemv_tuner("bmm")
+bmm_column_gemv_kernel = _make_bmm_gemv_tuner(
+    _column_gemv_kernel, "column_gemv", _prune_column_gemv
+)
 
 
 def _launch_column_gemv(a, b, out, bias=None, *, tuner):
@@ -788,22 +982,9 @@ def _prune_narrow_gemv(configs, named_args, **kwargs):
     ]
 
 
-def _make_narrow_gemv_tuner(op):
-    # BATCH is launch metadata for tuning and keeps different batch sizes
-    # distinct in the LibEntry cache. The kernel grid handles the batch itself.
-    return make_fixed_gemm_tuner(
-        _narrow_gemv_kernel,
-        op,
-        "narrow_gemv",
-        ["M", "K", "WITH_BIAS", "BATCH"],
-        {"BM": 8, "BK": 1024},
-        _prune_narrow_gemv,
-        stages=1,
-        dtype_resolver=gemm_dtype_resolver(op),
-    )
-
-
-bmm_narrow_gemv_kernel = _make_narrow_gemv_tuner("bmm")
+bmm_narrow_gemv_kernel = _make_bmm_gemv_tuner(
+    _narrow_gemv_kernel, "narrow_gemv", _prune_narrow_gemv
+)
 
 
 def _launch_narrow_gemv(a, b, out, bias=None, *, tuner):

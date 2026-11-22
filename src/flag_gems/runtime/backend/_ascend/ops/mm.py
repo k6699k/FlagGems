@@ -23,24 +23,27 @@ import triton.language.extra.cann.extension as al
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
-from flag_gems.runtime.backend._ascend.blas_resources import (
-    cube_tile_fits_910b,
-    is_ascend_910b,
-    prune_cube_tiles_910b,
-    vector_tile_fits_910b,
-)
-from flag_gems.runtime.backend._ascend.gemm_tuning import (
-    AscendBlasTuner,
-    _blockified,
-    launch_panel_gemm,
-    make_fixed_gemm_tuner,
-    prune_panel_gemm,
-    tune_fixed_gemm,
-)
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils.libentry import LibTunerRunMode
 
-from .bmm import _launch_tiled_gemm, _make_tiled_tuner, _select_direct_nt_tile
+from .bmm import (
+    _TILED_EXPAND_PATH,
+    _TILED_KEY,
+    FIXED_GEMM_EXPAND_PATH,
+    AscendBlasTuner,
+    _blockified,
+    _launch_tiled_gemm,
+    _prune_direct_nt_configs,
+    _select_direct_nt_tile,
+    _tiled_gemm_kernel,
+    _TiledGemmTuner,
+    cube_tile_fits_910b,
+    gemm_dtype_resolver,
+    is_ascend_910b,
+    prune_cube_tiles_910b,
+    tune_fixed_gemm,
+    vector_tile_fits_910b,
+)
 from .copy import copy as copy_tensor
 
 logger = logging.getLogger(__name__)
@@ -821,61 +824,126 @@ def _prune_mm_narrow_gemv(configs, named_args, **kwargs):
     return [cfg for cfg in configs if triton.cdiv(m, cfg.kwargs["BLOCK_OUT"]) <= 65535]
 
 
-mm_rectangular_kernel = make_fixed_gemm_tuner(
+def prune_panel_gemm(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    m, n, k, bn = (args[key] for key in ("M", "N", "K", "BN"))
+    is_910b = is_ascend_910b()
+    return [
+        cfg
+        for cfg in configs
+        if k % cfg.kwargs["BK"] == 0
+        and (
+            cube_tile_fits_910b(
+                cfg.kwargs["BM"],
+                bn,
+                cfg.kwargs["BK"],
+                args["A"].dtype.itemsize,
+                cfg.num_stages,
+            )
+            if is_910b
+            else triton.cdiv(m, cfg.kwargs["BM"]) * triton.cdiv(n, bn) <= 65535
+        )
+    ]
+
+
+def launch_panel_gemm(kernel, tuner, operands, shape, bm, bk):
+    # BN is part of the packed layout and must agree with the pack kernel.
+    m, n, _ = shape
+    bn = 256
+    panels = triton.cdiv(n, bn)
+    options = dict(multibuffer=True, unit_flag=True, sync_solver=False)
+    if tune_fixed_gemm(tuner):
+
+        def grid(meta):
+            return (min(triton.cdiv(m, meta["BM"]) * panels, 65535),)
+
+        tuner[grid](*operands, *shape, BN=bn, **options)
+    else:
+        grid = (min(triton.cdiv(m, bm) * panels, 65535),)
+        kernel[grid](*operands, *shape, bm, bn, bk, **options)
+
+
+def _make_mm_fixed_tuner(kernel, variant, key, preset, prune, space, *, stages=2):
+    return libentry()(
+        libtuner(
+            configs=[triton.Config(preset, num_warps=4, num_stages=stages)],
+            key=key,
+            prune_configs_by={"early_config_prune": prune},
+            use_cuda_graph=True,
+            policy=AscendBlasTuner,
+            flagtune_op_name="mm",
+            flagtune_op_id="flaggems/mm",
+            flagtune_variant=variant,
+            flagtune_expand_op_name=f"{space}_ascend",
+            flagtune_yaml_path=FIXED_GEMM_EXPAND_PATH,
+            disable_aabs=True,
+        )(kernel)
+    )
+
+
+mm_rectangular_kernel = _make_mm_fixed_tuner(
     _mm_rectangular_kernel.fn,
-    "mm",
     "rectangular",
     ["M", "N", "K"],
     {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 256},
     _prune_mm_rectangular,
-    space="mm_rectangular",
+    "mm_rectangular",
 )
-mm_narrow_gemv_kernel = make_fixed_gemm_tuner(
+mm_narrow_gemv_kernel = _make_mm_fixed_tuner(
     _mm_narrow_n_kernel.fn,
-    "mm",
     "narrow_gemv",
     ["M", "K"],
     {"BLOCK_OUT": 4, "BLOCK_K": 1024},
     _prune_mm_narrow_gemv,
-    space="mm_narrow_gemv",
+    "mm_narrow_gemv",
     stages=1,
 )
-mm_packed_narrow_kernel = make_fixed_gemm_tuner(
+mm_packed_narrow_kernel = _make_mm_fixed_tuner(
     _mm_packed_narrow_kernel,
-    "mm",
     "packed_narrow",
     ["M", "N", "K"],
     {"BM": 64, "BK": 512},
     _prune_mm_packed_narrow,
-    space="mm_packed_narrow",
+    "mm_packed_narrow",
 )
-mm_packed_narrow_nt_kernel = make_fixed_gemm_tuner(
+mm_packed_narrow_nt_kernel = _make_mm_fixed_tuner(
     _mm_packed_narrow_kernel,
-    "mm",
     "packed_narrow_nt",
     ["M", "N", "K"],
     {"BM": 16, "BK": 512},
     _prune_mm_packed_narrow,
-    space="mm_packed_narrow",
+    "mm_packed_narrow",
 )
-mm_direct_nt_kernel = _make_tiled_tuner("mm", "direct_nt_tiled")
-mm_wide_panel_kernel = make_fixed_gemm_tuner(
+mm_direct_nt_kernel = libentry()(
+    libtuner(
+        configs=[triton.Config(dict(BM=16, BN=64, BK=128), num_warps=4, num_stages=2)],
+        key=_TILED_KEY,
+        prune_configs_by={"early_config_prune": _prune_direct_nt_configs},
+        use_cuda_graph=True,
+        policy=_TiledGemmTuner,
+        flagtune_op_name="mm",
+        flagtune_op_id="flaggems/mm",
+        flagtune_variant="direct_nt_tiled",
+        flagtune_expand_op_name="tiled_gemm_ascend",
+        flagtune_yaml_path=_TILED_EXPAND_PATH,
+        flagtune_dtype_resolver=gemm_dtype_resolver("mm"),
+    )(_tiled_gemm_kernel)
+)
+mm_wide_panel_kernel = _make_mm_fixed_tuner(
     _mm_wide_panel_cube_kernel,
-    "mm",
     "wide_panels",
     ["M", "N", "K"],
     {"BM": 128, "BK": 128},
     prune_panel_gemm,
-    space="panel_gemm",
+    "panel_gemm",
 )
-mm_large_panel_kernel = make_fixed_gemm_tuner(
+mm_large_panel_kernel = _make_mm_fixed_tuner(
     _mm_large_panel_cube_kernel,
-    "mm",
     "large_panels",
     ["M", "N", "K"],
     {"BM": 128, "BK": 256},
     prune_panel_gemm,
-    space="panel_gemm",
+    "panel_gemm",
 )
 
 

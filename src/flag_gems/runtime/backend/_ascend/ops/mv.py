@@ -21,15 +21,18 @@ import triton.language as tl
 
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
-from flag_gems.runtime.backend._ascend.blas_resources import (
-    is_ascend_910b,
-    vector_tile_fits_910b,
-)
-from flag_gems.runtime.backend._ascend.gemm_tuning import AscendBlasTuner
 from flag_gems.runtime.flagtune import register_flagtune_op
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.libentry import LibTunerRunMode
+
+from .bmm import (
+    _FP32_BYTES,
+    _UB_BYTES,
+    AscendBlasTuner,
+    is_ascend_910b,
+    vector_tile_fits_910b,
+)
 
 logger = logging.getLogger(__name__)
 _MV_EXPAND_PATH = str(Path(__file__).resolve().parent.parent / "mv_ascend_expand.yaml")
@@ -57,12 +60,17 @@ def _prune_mv_configs(configs, named_args, **kwargs):
         if triton.cdiv(args["N"], block_n) > _MV_MAX_GRID:
             continue
         if is_910b:
+            # The legacy strided gather needs additional UB scratch.
+            if (
+                strided_reduction
+                and max(block_n, 2) * block_m * _FP32_BYTES >= _UB_BYTES // 12
+            ):
+                continue
             if vector_tile_fits_910b(
                 block_n,
                 block_m,
                 dtype.itemsize,
                 config.num_stages,
-                strided=strided_reduction,
             ):
                 valid.append(config)
             continue

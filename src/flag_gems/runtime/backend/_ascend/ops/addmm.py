@@ -23,37 +23,73 @@ import triton.language.extra.cann.extension as extension
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
-from flag_gems.runtime.backend._ascend.gemm_tuning import (
-    ResourcePrunedGemmTuner,
-    gemm_dtype_resolver,
-    is_ascend_910c,
-    launch_panel_gemm,
-    make_fixed_gemm_tuner,
-    prune_910c_addmm_stage3_tail,
-    prune_panel_gemm,
-)
 from flag_gems.utils import broadcastable_to, libentry, libtuner
 
 from .bmm import (
+    _TILED_EXPAND_PATH,
+    _TILED_KEY,
+    FIXED_GEMM_EXPAND_PATH,
+    AscendBlasTuner,
+    ResourcePrunedGemmTuner,
     _launch_narrow_gemv,
     _launch_narrow_pack,
     _launch_nt_gemm,
     _launch_tiled_gemm,
-    _make_narrow_gemv_tuner,
-    _make_tiled_tuner,
+    _narrow_gemv_kernel,
+    _prune_narrow_gemv,
+    _prune_tiled_gemm_configs,
     _select_rectangular_tile,
+    _tiled_gemm_kernel,
+    _TiledGemmTuner,
     _use_narrow_gemv,
     _use_narrow_pack,
     _use_nt_gemm,
+    gemm_dtype_resolver,
+    is_ascend_910c,
 )
-from .mm import _blockified, _mm_pack_wide_panels_kernel
+from .mm import (
+    _blockified,
+    _mm_pack_wide_panels_kernel,
+    launch_panel_gemm,
+    prune_panel_gemm,
+)
 
 logger = logging.getLogger(__name__)
 _MAX_ADDMM_PROGRAMS = 32768
-addmm_tiled_kernel = _make_tiled_tuner("addmm")
-addmm_narrow_gemv_kernel = _make_narrow_gemv_tuner("addmm")
 _ADDMM_EXPAND_PATH = str(
     Path(__file__).resolve().parent.parent / "addmm_ascend_expand.yaml"
+)
+
+addmm_tiled_kernel = libentry()(
+    libtuner(
+        configs=[triton.Config(dict(BM=16, BN=64, BK=128), num_warps=4, num_stages=2)],
+        key=_TILED_KEY,
+        prune_configs_by={"early_config_prune": _prune_tiled_gemm_configs},
+        use_cuda_graph=True,
+        policy=_TiledGemmTuner,
+        flagtune_op_name="addmm",
+        flagtune_op_id="flaggems/addmm",
+        flagtune_variant="tiled_gemm",
+        flagtune_expand_op_name="tiled_gemm_ascend",
+        flagtune_yaml_path=_TILED_EXPAND_PATH,
+        flagtune_dtype_resolver=gemm_dtype_resolver("addmm"),
+    )(_tiled_gemm_kernel)
+)
+addmm_narrow_gemv_kernel = libentry()(
+    libtuner(
+        configs=[triton.Config({"BM": 8, "BK": 1024}, num_warps=4, num_stages=1)],
+        key=["M", "K", "WITH_BIAS", "BATCH"],
+        prune_configs_by={"early_config_prune": _prune_narrow_gemv},
+        use_cuda_graph=True,
+        policy=AscendBlasTuner,
+        flagtune_op_name="addmm",
+        flagtune_op_id="flaggems/addmm",
+        flagtune_variant="narrow_gemv",
+        flagtune_expand_op_name="narrow_gemv_ascend",
+        flagtune_yaml_path=FIXED_GEMM_EXPAND_PATH,
+        flagtune_dtype_resolver=gemm_dtype_resolver("addmm"),
+        disable_aabs=True,
+    )(_narrow_gemv_kernel)
 )
 
 
@@ -117,6 +153,18 @@ def _prune_addmm_configs(configs, named_args, **kwargs):
         for config in configs
         if tuple(config.kwargs[k] for k in ("BLOCK_M", "BLOCK_N", "BLOCK_K")) in tiles
     ]
+
+
+def prune_910c_addmm_stage3_tail(m, n, k, meta, stages):
+    """Reject stage-3 BF16 ADDMM tiles with a narrow N and near-full M tail."""
+    bm, bn, bk = (meta[key] for key in ("BLOCK_M", "BLOCK_N", "BLOCK_K"))
+    return (
+        stages == 3
+        and 4 * n <= bn
+        and 8 * (m % bm) >= 7 * bm
+        and k >= max(4096, 16 * bk)
+        and k % bk == 0
+    )
 
 
 class _AddMMFlagTuneTuner(ResourcePrunedGemmTuner):
@@ -436,15 +484,21 @@ def _addmm_wide_panel_kernel(
     tl.store(Out + offset, acc, m[:, None] < M)
 
 
-addmm_wide_panel_kernel = make_fixed_gemm_tuner(
-    _addmm_wide_panel_kernel,
-    "addmm",
-    "wide_panels",
-    ["M", "N", "K"],
-    {"BM": 128, "BK": 256},
-    prune_panel_gemm,
-    space="panel_gemm",
-    dtype_resolver=gemm_dtype_resolver("addmm", rhs="Packed"),
+addmm_wide_panel_kernel = libentry()(
+    libtuner(
+        configs=[triton.Config({"BM": 128, "BK": 256}, num_warps=4, num_stages=2)],
+        key=["M", "N", "K"],
+        prune_configs_by={"early_config_prune": prune_panel_gemm},
+        use_cuda_graph=True,
+        policy=AscendBlasTuner,
+        flagtune_op_name="addmm",
+        flagtune_op_id="flaggems/addmm",
+        flagtune_variant="wide_panels",
+        flagtune_expand_op_name="panel_gemm_ascend",
+        flagtune_yaml_path=FIXED_GEMM_EXPAND_PATH,
+        flagtune_dtype_resolver=gemm_dtype_resolver("addmm", rhs="Packed"),
+        disable_aabs=True,
+    )(_addmm_wide_panel_kernel)
 )
 
 

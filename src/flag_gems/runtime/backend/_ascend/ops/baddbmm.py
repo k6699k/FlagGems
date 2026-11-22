@@ -24,36 +24,93 @@ from flag_gems import runtime
 from flag_gems.ops.mul import mul
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
-from flag_gems.runtime.backend._ascend.gemm_tuning import (
-    ResourcePrunedGemmTuner,
-    prune_910c_baddbmm_short_k,
-)
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as tle
 
 from .bmm import (
+    _TILED_EXPAND_PATH,
+    _TILED_KEY,
+    FIXED_GEMM_EXPAND_PATH,
+    AscendBlasTuner,
+    ResourcePrunedGemmTuner,
+    _column_gemv_kernel,
     _launch_column_gemv,
     _launch_narrow_gemv,
     _launch_narrow_pack,
     _launch_nt_gemm,
     _launch_tiled_gemm,
-    _make_column_gemv_tuner,
-    _make_narrow_gemv_tuner,
-    _make_tiled_tuner,
+    _narrow_gemv_kernel,
+    _prune_column_gemv,
+    _prune_direct_nt_configs,
+    _prune_narrow_gemv,
+    _prune_tiled_gemm_configs,
     _select_direct_nt_tile,
     _select_rectangular_tile,
+    _tiled_gemm_kernel,
+    _TiledGemmTuner,
     _use_column_gemv,
     _use_narrow_gemv,
     _use_narrow_pack,
     _use_nt_gemm,
     bmm,
+    gemm_dtype_resolver,
 )
 
 logger = logging.getLogger(__name__)
-baddbmm_tiled_kernel = _make_tiled_tuner("baddbmm")
-baddbmm_direct_nt_kernel = _make_tiled_tuner("baddbmm", "direct_nt_tiled")
-baddbmm_column_gemv_kernel = _make_column_gemv_tuner("baddbmm")
-baddbmm_narrow_gemv_kernel = _make_narrow_gemv_tuner("baddbmm")
+
+
+def _make_baddbmm_tiled_tuner(variant, prune):
+    return libentry()(
+        libtuner(
+            configs=[
+                triton.Config(dict(BM=16, BN=64, BK=128), num_warps=4, num_stages=2)
+            ],
+            key=_TILED_KEY,
+            prune_configs_by={"early_config_prune": prune},
+            use_cuda_graph=True,
+            policy=_TiledGemmTuner,
+            flagtune_op_name="baddbmm",
+            flagtune_op_id="flaggems/baddbmm",
+            flagtune_variant=variant,
+            flagtune_expand_op_name="tiled_gemm_ascend",
+            flagtune_yaml_path=_TILED_EXPAND_PATH,
+            flagtune_dtype_resolver=gemm_dtype_resolver("baddbmm"),
+        )(_tiled_gemm_kernel)
+    )
+
+
+def _make_baddbmm_gemv_tuner(kernel, variant, prune):
+    # BATCH is launch metadata and keeps distinct batch sizes in the tuning key.
+    return libentry()(
+        libtuner(
+            configs=[triton.Config({"BM": 8, "BK": 1024}, num_warps=4, num_stages=1)],
+            key=["M", "K", "WITH_BIAS", "BATCH"],
+            prune_configs_by={"early_config_prune": prune},
+            use_cuda_graph=True,
+            policy=AscendBlasTuner,
+            flagtune_op_name="baddbmm",
+            flagtune_op_id="flaggems/baddbmm",
+            flagtune_variant=variant,
+            flagtune_expand_op_name=f"{variant}_ascend",
+            flagtune_yaml_path=FIXED_GEMM_EXPAND_PATH,
+            flagtune_dtype_resolver=gemm_dtype_resolver("baddbmm"),
+            disable_aabs=True,
+        )(kernel)
+    )
+
+
+baddbmm_tiled_kernel = _make_baddbmm_tiled_tuner(
+    "tiled_gemm", _prune_tiled_gemm_configs
+)
+baddbmm_direct_nt_kernel = _make_baddbmm_tiled_tuner(
+    "direct_nt_tiled", _prune_direct_nt_configs
+)
+baddbmm_column_gemv_kernel = _make_baddbmm_gemv_tuner(
+    _column_gemv_kernel, "column_gemv", _prune_column_gemv
+)
+baddbmm_narrow_gemv_kernel = _make_baddbmm_gemv_tuner(
+    _narrow_gemv_kernel, "narrow_gemv", _prune_narrow_gemv
+)
 
 
 _BADDBMM_CONFIGS = runtime.get_tuned_config("baddbmm")
@@ -124,6 +181,11 @@ def _broadcast_strides(tensor, shape):
         else:
             raise RuntimeError("bias cannot be broadcast to the baddbmm output shape")
     return tuple(strides)
+
+
+def prune_910c_baddbmm_short_k(k, tile_k, stages):
+    """Avoid 910C L0C conflicts when a pipelined K tile exceeds the reduction."""
+    return stages >= 2 and tile_k > k
 
 
 class _BaddBMMFlagTuneTuner(ResourcePrunedGemmTuner):

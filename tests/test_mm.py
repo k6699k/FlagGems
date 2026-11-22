@@ -457,10 +457,14 @@ def test_mm_ascend_review_broadcast_materialize(monkeypatch):
 def test_mm_ascend_review_specialized_launch_cap(monkeypatch, M, N, K):
     from contextlib import nullcontext
 
+    monkeypatch.setenv("USE_FLAGTUNE", "0")
     ops = flag_gems.mm.__globals__
     grids = []
 
     class Capture:
+        def __init__(self, kernel):
+            self.fn = getattr(kernel, "fn", None)
+
         def __getitem__(self, grid):
             def launch(*args, **kwargs):
                 assert not callable(grid)
@@ -468,9 +472,9 @@ def test_mm_ascend_review_specialized_launch_cap(monkeypatch, M, N, K):
 
             return launch
 
-    for name in list(ops):
+    for name, kernel in list(ops.items()):
         if name.endswith("_kernel"):
-            monkeypatch.setitem(ops, name, Capture())
+            monkeypatch.setitem(ops, name, Capture(kernel))
     monkeypatch.setattr(ops["torch_device_fn"], "device", lambda *args: nullcontext())
     a = torch.empty((M, K), device="meta", dtype=torch.bfloat16)
     b = torch.empty((K, N), device="meta", dtype=a.dtype)
