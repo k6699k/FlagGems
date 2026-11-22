@@ -615,7 +615,7 @@ class BenchmarkWorker:
                     int(evaluate_compiled(dim, values, {})) for dim in tensor.shape
                 )
             layout = evaluate_compiled(tensor.layout, values, {})
-            if layout not in {"contiguous", "transposed_2d", "transposed_last2"}:
+            if layout not in {"contiguous", "transposed_2d"}:
                 raise BenchmarkExecutionError(
                     f"unsupported tensor layout {layout!r} for {tensor.name!r}"
                 )
@@ -623,20 +623,17 @@ class BenchmarkWorker:
                 raise BenchmarkExecutionError(
                     f"transposed_2d tensor {tensor.name!r} requires a two-dimensional shape"
                 )
-            transposed = layout in {"transposed_2d", "transposed_last2"}
-            if transposed and len(shape) < 2:
-                raise BenchmarkExecutionError(
-                    f"transposed tensor {tensor.name!r} requires at least two dimensions"
-                )
             allocation_shape = (
-                (*shape[:-2], shape[-1], shape[-2]) if transposed else shape
+                tuple(reversed(shape)) if layout == "transposed_2d" else shape
             )
             value = self.device_runtime.make_tensor(
                 tensor.factory,
                 allocation_shape,
                 dtype=dtype_by_tensor[tensor.name],
             )
-            tensors[tensor.name] = value.transpose(-2, -1) if transposed else value
+            tensors[tensor.name] = (
+                value.transpose(0, 1) if layout == "transposed_2d" else value
+            )
         return tensors
 
     def _resolve_runtime_route(
@@ -661,7 +658,6 @@ class BenchmarkWorker:
                 runtime_context={
                     "platform_key": gpu["platform_key"],
                     "recipe": dict(values),
-                    "requested_tuning_variant": tuning_variant(self.spec, variant),
                 },
             )
         except (KeyError, RuntimeError, ValueError, AttributeError) as exc:
@@ -872,9 +868,9 @@ class BenchmarkWorker:
             which bypasses ConfigCache and BenchmarkCache, so repeated trials
             are genuinely independent instead of replaying one stored sample.
             That API needs the low-level argument context captured by
-            ``LibTuner.run``; this method obtains it with a scoped policy that
-            selects the first supplied config without measuring candidates or
-            reusing a cached winner. The label order
+            ``LibTuner.run``; this method obtains it by scoping the tuner to a
+            single config, which takes ``run``'s no-policy branch and selects
+            that config without tuning or touching either cache. The label order
             is reversed on every odd trial in interleaved mode so drift across the measurement
             window cannot systematically favour whichever side is measured
             first.
@@ -946,36 +942,14 @@ class BenchmarkWorker:
             )
         )
 
-        from flag_gems.utils.libentry import (
-            LibTunerRunMode,
-            clear_libentry_dispatch_cache,
-        )
-
-        first_config = configs[labels[0]]
-        previous_policy = vars(tuner).get("policy")
-        captured = False
-
-        def select_config(_bench, _configs, _args, _kwargs):
-            nonlocal captured
-            captured = True
-            return first_config, {}
+        from flag_gems.utils.libentry import clear_libentry_dispatch_cache
 
         clear_libentry_dispatch_cache(kernel)
-        tuner._set_configs_and_strategy([first_config], base_strategy)
-        tuner.policy = select_config
+        tuner._set_configs_and_strategy([configs[labels[0]]], base_strategy)
         try:
-            with tuner.use_run_mode(LibTunerRunMode.FORCE_POLICY):
-                self._invoke(tensors, variant)
-            if not captured:
-                raise BenchmarkExecutionError(
-                    f"public {self.spec.public_operator_name} call did not execute expected variant {variant!r}"
-                )
+            self._invoke(tensors, variant)
             self.device_runtime.synchronize()
         finally:
-            if previous_policy is None:
-                del tuner.policy
-            else:
-                tuner.policy = previous_policy
             tuner._set_configs_and_strategy(base_configs, base_strategy)
             clear_libentry_dispatch_cache(kernel)
 

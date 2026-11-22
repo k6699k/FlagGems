@@ -435,11 +435,6 @@ def compare_rows(
         output["baseline_tuning_time_ms"] = format_ms(baseline_tuning)
         output["ours_tuning_time_ms"] = format_ms(ours_tuning)
         output["tuning_speedup"] = format_derived(tuning_speedup)
-        output["tuning_time_reduction_pct"] = format_derived(
-            None
-            if tuning_speedup is None or baseline_tuning == 0
-            else 100.0 * (1.0 - ours_tuning / baseline_tuning)
-        )
         output["baseline_latency_p50_ms"] = format_ms(baseline_latency)
         output["ours_latency_p50_ms"] = format_ms(ours_latency)
         output["relative_throughput_pct"] = format_derived(relative_throughput)
@@ -463,7 +458,6 @@ def output_fieldnames(dimensions: Sequence[str]) -> list[str]:
             "baseline_tuning_time_ms",
             "ours_tuning_time_ms",
             "tuning_speedup",
-            "tuning_time_reduction_pct",
             "baseline_latency_p50_ms",
             "ours_latency_p50_ms",
             "relative_throughput_pct",
@@ -562,9 +556,6 @@ def comparison_json_row(
         "ours": _policy_json(row, "ours"),
         "comparison": {
             "tuning_speedup": rounded_derived(row.get("tuning_speedup")),
-            "tuning_time_reduction_pct": rounded_derived(
-                row.get("tuning_time_reduction_pct")
-            ),
             "relative_throughput_pct": rounded_derived(
                 row.get("relative_throughput_pct")
             ),

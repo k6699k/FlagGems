@@ -73,7 +73,7 @@ _FIELD_KEYS = {
 }
 _TENSOR_KEYS = {"factory", "shape", "dtype", "layout"}
 _FACTORIES = {"randn", "zeros", "ones", "empty"}
-_TENSOR_LAYOUTS = {"contiguous", "transposed_2d", "transposed_last2"}
+_TENSOR_LAYOUTS = {"contiguous", "transposed_2d"}
 _PUBLIC_OPERATOR_OVERRIDES: dict[str, str] = {}
 
 
@@ -186,17 +186,7 @@ def _shape_equal(lhs: Any, rhs: Any) -> int:
     return int(_shape_tuple(lhs) == _shape_tuple(rhs))
 
 
-def _shape_cdiv(numerator: int, denominator: int) -> int:
-    """Round up an integer shape division."""
-    if not isinstance(numerator, int) or not isinstance(denominator, int):
-        raise ValueError("cdiv shape arguments must be integers")
-    if denominator <= 0:
-        raise ValueError("cdiv shape denominator must be positive")
-    return -(-numerator // denominator)
-
-
 _SHAPE_OPERATIONS = {
-    "cdiv": _shape_cdiv,
     "broadcast_numel": _broadcast_numel,
     "broadcast_last_dim": _broadcast_last_dim,
     "broadcast_rank": _broadcast_rank,

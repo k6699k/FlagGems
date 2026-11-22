@@ -2,7 +2,6 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,62 +13,6 @@ import flag_gems
 pytestmark = pytest.mark.skipif(
     flag_gems.vendor_name != "ascend", reason="requires Ascend NPU"
 )
-
-
-@pytest.mark.parametrize(
-    "op,variant,expected_count,inputs",
-    [
-        ("mv", "gemv", 216, {"M": 91, "N": 37}),
-        ("addmm", "gemm", 132, {"M": 128, "N": 256, "K": 128}),
-        ("baddbmm", "batched_gemm", 550, {"BATCH": 2, "M": 65, "N": 80, "K": 48}),
-        ("addmm", "tiled_gemm", 86, {"M": 48, "N": 80, "K": 4096, "TRANSPOSED": 1}),
-        ("bmm", "tiled_gemm", 86, {"BATCH": 2, "M": 64, "N": 96, "K": 4095}),
-        ("baddbmm", "tiled_gemm", 86, {"BATCH": 2, "M": 64, "N": 96, "K": 4095}),
-        ("addmm", "narrow_gemv", 20, {"M": 272, "K": 2048}),
-        ("bmm", "narrow_gemv", 20, {"BATCH": 2, "M": 264, "K": 1024}),
-        ("baddbmm", "narrow_gemv", 20, {"BATCH": 2, "M": 280, "K": 1024}),
-        ("mm", "narrow_gemv", 22, {"M": 263, "K": 1009}),
-        ("mm", "rectangular", 96, {"M": 16, "N": 64, "K": 2048}),
-        ("mm", "packed_narrow", 28, {"M": 128, "N": 16, "K": 2048}),
-        ("mm", "wide_panels", 24, {"M": 8, "N": 131072, "K": 1280}),
-        ("mm", "large_panels", 24, {"M": 1088, "N": 8449, "K": 2304}),
-        ("addmm", "wide_panels", 24, {"M": 8, "N": 131072, "K": 1024}),
-    ],
-)
-def test_ascend_blas_contract_matches_runtime(op, variant, expected_count, inputs):
-    from triton.flagtune.training.ranker import load_training_variant
-
-    from flag_gems.flagtune.offline.contracts.operator import (
-        load_operator_benchmark_spec,
-    )
-    from flag_gems.flagtune.offline.train.config_space import (
-        runtime_configs_for_variant,
-    )
-    from flag_gems.utils.libentry import LibTuner, find_flagtune_benchmark_target
-
-    public = getattr(flag_gems, op)
-    assert "_ascend.ops." in public.__module__
-    _, tuner = find_flagtune_benchmark_target(public, f"flaggems/{op}", variant)
-    assert isinstance(tuner, LibTuner.get("flagtune"))
-    assert tuner._flagtune_op_id == "flaggems/" + op
-    assert tuner._flagtune_variant == variant
-    contract = (
-        Path(flag_gems.__file__).parent
-        / "flagtune/offline/contracts/configs"
-        / (op + "_ascend_flagtune_configs.yaml")
-    )
-    assert load_operator_benchmark_spec(contract).op_id == "flaggems/" + op
-    model_variant = load_training_variant(contract, variant)
-    configs = runtime_configs_for_variant("flaggems/" + op, variant, platform="ascend")
-    assert len(configs) == expected_count
-    config_dicts = [
-        dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages) for c in configs
-    ]
-    assert all(model_variant.param_space.validate(c) for c in config_dicts)
-    assert model_variant.build_feature_matrix(inputs, config_dicts).shape == (
-        len(configs),
-        len(model_variant.feature_names),
-    )
 
 
 @pytest.mark.parametrize("reduction", [2048, 2049, 4097])

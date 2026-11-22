@@ -23,21 +23,7 @@ from collections.abc import Mapping
 from typing import Any
 
 BACKEND_MODULES = {
-    "bmm": {
-        "ascend": "flag_gems.runtime.backend._ascend.ops.bmm",
-    },
-    "baddbmm": {
-        "ascend": "flag_gems.runtime.backend._ascend.ops.baddbmm",
-    },
-    "addmm": {
-        "ascend": "flag_gems.runtime.backend._ascend.ops.addmm",
-    },
-    "mv": {
-        "ascend": "flag_gems.runtime.backend._ascend.ops.mv",
-    },
-    "mul": {"ascend": "flag_gems.runtime.backend._ascend.ops.mul"},
     "mm": {
-        "ascend": "flag_gems.runtime.backend._ascend.ops.mm",
         "metax": "flag_gems.runtime.backend._metax.ops.mm",
         "nvidia": "flag_gems.runtime.backend._nvidia.hopper.ops.mm",
     },
@@ -57,8 +43,6 @@ def _normalized_platform(text: str) -> str | None:
         return "mthreads"
     if "thead" in text:
         return "thead"
-    if "ascend" in text or text == "npu":
-        return "ascend"
     return None
 
 

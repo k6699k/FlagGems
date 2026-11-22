@@ -416,18 +416,6 @@ def _grouped_chunks(
         yield batch
 
 
-def _collection_latency_scope(record: Mapping[str, Any]) -> str:
-    stage = record.get("stage")
-    if stage == "compute":
-        return "compute_kernel"
-    if stage == "partial" or any(
-        str(record.get(name, "")).endswith("_partial")
-        for name in ("tuning_variant", "variant")
-    ):
-        return "partial_kernel"
-    return "public_kernel"
-
-
 def _collection_group_key(
     record: Any,
     variant_info: Any,
@@ -453,7 +441,7 @@ def _collection_group_key(
     stage = route.get("stage") or (
         "partial" if str(tuning_variant).endswith("_partial") else "public"
     )
-    latency_scope = _collection_latency_scope({"stage": stage})
+    latency_scope = "partial_kernel" if stage == "partial" else "public_kernel"
     return json.dumps(
         {
             "operator_id": variant_info.op_id,
@@ -529,7 +517,13 @@ def _append_collection_rows(
                     if name in result
                 }
             inputs = variant_info.normalize_inputs(shape_values)
-            expected_scope = _collection_latency_scope(result)
+            expected_scope = (
+                "partial_kernel"
+                if result.get("stage") == "partial"
+                or str(result.get("tuning_variant", "")).endswith("_partial")
+                or str(result.get("variant", "")).endswith("_partial")
+                else "public_kernel"
+            )
             group = {
                 "operator_id": variant_info.op_id,
                 "variant": result.get("tuning_variant") or variant_info.name,
@@ -582,7 +576,13 @@ def _append_collection_rows(
                 failure_file.write("\n")
                 failed_shapes += 1
                 continue
-            expected_scope = _collection_latency_scope(result)
+            expected_scope = (
+                "partial_kernel"
+                if result.get("stage") == "partial"
+                or str(result.get("tuning_variant", "")).endswith("_partial")
+                or str(result.get("variant", "")).endswith("_partial")
+                else "public_kernel"
+            )
             if result.get("latency_scope") not in {None, expected_scope}:
                 failed = pretune_json_row(result, shape_fields)
                 failed["collection_error"] = "latency_scope does not match tuning stage"
