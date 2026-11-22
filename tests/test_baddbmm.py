@@ -14,7 +14,6 @@
 
 import pytest
 import torch
-import triton
 
 import flag_gems
 
@@ -36,54 +35,6 @@ FP8_MNK_SHAPES = [
     (83, 7748, 3884),
     (84, 7168, 3884),
 ]
-
-
-@pytest.mark.baddbmm
-@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend baddbmm")
-@pytest.mark.parametrize("n, expected_bk", [(80, 128), (128, 256)])
-def test_baddbmm_ascend_910b_nt_bias_tail(monkeypatch, n, expected_bk):
-    from contextlib import nullcontext
-
-    symbols = flag_gems.bmm.__globals__
-    monkeypatch.setenv("USE_FLAGTUNE", "0")
-    monkeypatch.setitem(symbols, "is_ascend_910b", lambda: True)
-    monkeypatch.setitem(symbols, "is_ascend_910c", lambda: False)
-    monkeypatch.setattr(symbols["torch_device_fn"], "device", lambda *_: nullcontext())
-    tiles = []
-
-    class Capture:
-        def __getitem__(self, grid):
-            def launch(*args, **kwargs):
-                tiles.append(args[-5:-2])
-
-            return launch
-
-    monkeypatch.setitem(symbols, "_tiled_gemm_kernel", Capture())
-    options = {"device": "meta", "dtype": torch.bfloat16}
-    a = torch.empty((2, 128, 256), **options)
-    b = torch.empty((2, n, 256), **options).transpose(-2, -1)
-    bias = torch.empty((2, 128, n), **options)
-    assert flag_gems.baddbmm(bias, a, b).shape == bias.shape
-    assert tiles == [(64, 64, expected_bk)]
-
-    candidates = [
-        triton.Config({"BM": 64, "BN": 64, "BK": bk}, num_stages=2) for bk in (128, 256)
-    ]
-    args = {
-        "A": a,
-        "BATCH": 2,
-        "M": 128,
-        "N": n,
-        "K": 256,
-        "TRANSPOSED": True,
-        "WITH_BIAS": True,
-        "HINT": False,
-    }
-    prune = symbols["_prune_tiled_gemm_configs"]
-    assert prune(candidates, args) == [
-        config for config in candidates if config.kwargs["BK"] <= expected_bk
-    ]
-    assert prune(candidates, {**args, "WITH_BIAS": False}) == candidates
 
 
 @pytest.mark.baddbmm

@@ -138,29 +138,6 @@ def resolve_benchmarker(
     selected = _validate_request(mode, warmup_ms, measurement_ms, n_retries)
     active = driver.active
     if selected is BenchmarkMode.REPLAY:
-        if type(active).__module__.startswith("triton.backends.ascend."):
-            from flag_gems.utils.libentry import _bench_ascend_graph
-
-            per_replay_ms = float(measurement_ms) / 10
-
-            def ascend_replay_benchmark(kernel_call, quantiles):
-                return _bench_ascend_graph(
-                    kernel_call, rep=per_replay_ms, quantiles=quantiles
-                )
-
-            return ResolvedBenchmarker(
-                protocol=BenchmarkProtocol(
-                    requested_mode=selected,
-                    resolved_mode=BenchmarkMode.REPLAY,
-                    implementation="ascend_npu_graph_replay_v1",
-                    cache_policy="warm_l2",
-                    warmup_ms=warmup_ms,
-                    measurement_ms=measurement_ms,
-                    n_retries=10,
-                    per_replay_ms=per_replay_ms,
-                ),
-                benchmark=ascend_replay_benchmark,
-            )
         implementation = _replay_implementation(active)
         if implementation is not None:
             from triton.testing import do_bench_cudagraph

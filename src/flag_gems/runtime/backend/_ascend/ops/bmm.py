@@ -119,9 +119,12 @@ def _blockified():
 
 def tune_fixed_gemm(tuner):
     # Keep the upstream preset until tuning is selected or requested offline.
+    autotuner = getattr(tuner, "fn", None)
+    if not isinstance(autotuner, LibTuner):
+        return False
     return (
-        tuner.fn._run_mode is not LibTunerRunMode.NORMAL
-        or runtime.flagtune_enabled(tuner.fn._flagtune_op_name)
+        autotuner._run_mode is not LibTunerRunMode.NORMAL
+        or runtime.flagtune_enabled(autotuner._flagtune_op_name)
         or runtime.resolve_cost_model_intent(supports_cost_model=True)
         is runtime.CostModelIntent.REQUIRED
     )

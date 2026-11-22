@@ -872,9 +872,9 @@ class BenchmarkWorker:
             which bypasses ConfigCache and BenchmarkCache, so repeated trials
             are genuinely independent instead of replaying one stored sample.
             That API needs the low-level argument context captured by
-            ``LibTuner.run``; this method obtains it by scoping the tuner to a
-            single config, which takes ``run``'s no-policy branch and selects
-            that config without tuning or touching either cache. The label order
+            ``LibTuner.run``; this method obtains it with a scoped policy that
+            selects the first supplied config without measuring candidates or
+            reusing a cached winner. The label order
             is reversed on every odd trial in interleaved mode so drift across the measurement
             window cannot systematically favour whichever side is measured
             first.
@@ -951,13 +951,31 @@ class BenchmarkWorker:
             clear_libentry_dispatch_cache,
         )
 
+        first_config = configs[labels[0]]
+        previous_policy = vars(tuner).get("policy")
+        captured = False
+
+        def select_config(_bench, _configs, _args, _kwargs):
+            nonlocal captured
+            captured = True
+            return first_config, {}
+
         clear_libentry_dispatch_cache(kernel)
-        tuner._set_configs_and_strategy([configs[labels[0]]], base_strategy)
+        tuner._set_configs_and_strategy([first_config], base_strategy)
+        tuner.policy = select_config
         try:
-            with tuner.use_run_mode(LibTunerRunMode.FIXED_CONFIG):
+            with tuner.use_run_mode(LibTunerRunMode.FORCE_POLICY):
                 self._invoke(tensors, variant)
+            if not captured:
+                raise BenchmarkExecutionError(
+                    f"public {self.spec.public_operator_name} call did not execute expected variant {variant!r}"
+                )
             self.device_runtime.synchronize()
         finally:
+            if previous_policy is None:
+                del tuner.policy
+            else:
+                tuner.policy = previous_policy
             tuner._set_configs_and_strategy(base_configs, base_strategy)
             clear_libentry_dispatch_cache(kernel)
 
