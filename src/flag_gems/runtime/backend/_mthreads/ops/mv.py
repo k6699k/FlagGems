@@ -19,8 +19,8 @@ output rows and ``M`` is the reduction length.  Each program owns ``BLOCK_N``
 output rows and walks the reduction dimension in ``BLOCK_M`` element tiles,
 accumulating in FP32.
 
-The default launch schedule is selected by a static table.
-On MTT S5000 the reduction tile that wins is 512 or 1024
+The launch schedule is selected by a static table rather than by the shared
+``mv`` autotuner.  On MTT S5000 the reduction tile that wins is 512 or 1024
 elements, which lies outside the ``block_m`` range the generic ``mv`` tuning
 space offers for this backend, so autotuning converges on a schedule that is
 slower than the vendor GEMV.  The table below is the outcome of a measured
@@ -29,22 +29,16 @@ of the FlagOSTune inference configurations.
 """
 
 import logging
-from pathlib import Path
 
 import torch
 import triton
 import triton.language as tl
 
-from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry, libtuner
+from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
-from flag_gems.utils.libentry import LibTunerRunMode
 
 logger = logging.getLogger(__name__)
-EXPAND_CONFIG_FILENAME = str(
-    Path(__file__).resolve().parent.parent / "mv_mthreads_expand.yaml"
-)
 
 
 @libentry()
@@ -124,24 +118,6 @@ def _launch_config(n, m):
     return block_n, block_m, 8, 4
 
 
-mv_tuned_kernel = libentry()(
-    libtuner(
-        configs=[
-            triton.Config({"BLOCK_N": 1, "BLOCK_M": 512}, num_warps=8, num_stages=4)
-        ],
-        key=["N", "M", "stride_an", "stride_am", "stride_bm", "stride_cn"],
-        use_cuda_graph=True,
-        disable_aabs=True,
-        policy="flagtune",
-        flagtune_op_name="mv",
-        flagtune_expand_op_name="mv_mthreads",
-        flagtune_op_id="flaggems/mv",
-        flagtune_variant="gemv",
-        flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
-    )(mv_kernel.jit_function)
-)
-
-
 def mv(inp, vec):
     logger.debug("GEMS_MTHREADS MV")
     assert inp.dim() == 2 and vec.dim() == 1, "mv expects a matrix and a vector"
@@ -149,36 +125,24 @@ def mv(inp, vec):
 
     N, M = inp.shape
     out = torch.empty((N,), device=inp.device, dtype=inp.dtype)
-    args = (
-        inp,
-        vec,
-        out,
-        N,
-        M,
-        inp.stride(0),
-        inp.stride(1),
-        vec.stride(0),
-        out.stride(0),
-    )
-    tune = (
-        mv_tuned_kernel.fn._run_mode is not LibTunerRunMode.NORMAL
-        or runtime.flagtune_enabled("mv")
-        or runtime.resolve_cost_model_intent(supports_cost_model=True)
-        is runtime.CostModelIntent.REQUIRED
-    )
+    block_n, block_m, num_warps, num_stages = _launch_config(N, M)
 
     with torch_device_fn.device(inp.device):
-        if tune:
-            mv_tuned_kernel[lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)](*args)
-        else:
-            block_n, block_m, num_warps, num_stages = _launch_config(N, M)
-            mv_kernel[(triton.cdiv(N, block_n),)](
-                *args,
-                BLOCK_N=block_n,
-                BLOCK_M=block_m,
-                num_warps=num_warps,
-                num_stages=num_stages,
-            )
+        mv_kernel[(triton.cdiv(N, block_n),)](
+            inp,
+            vec,
+            out,
+            N,
+            M,
+            inp.stride(0),
+            inp.stride(1),
+            vec.stride(0),
+            out.stride(0),
+            BLOCK_N=block_n,
+            BLOCK_M=block_m,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
     return out
 
 
