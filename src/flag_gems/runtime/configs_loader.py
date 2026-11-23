@@ -373,7 +373,7 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name in ("mv", "mv_row", "mv_column", "mv_ascend"):
+        if op_name in ("mv", "mv_row", "mv_column", "mv_ascend", "mv_mthreads"):
             return [
                 triton.Config(
                     {
@@ -1511,6 +1511,10 @@ class TunedConfigLoader(object):
             "mv_row": self._build_single_expand_spec("mv_row"),
             "mv_column": self._build_single_expand_spec("mv_column"),
             "mv_reduce": self._build_single_expand_spec("mv_reduce"),
+            "mv_mthreads": {
+                "key": ["N", "M", "stride_an", "stride_am", "stride_bm", "stride_cn"],
+                "default_strategy": ["default"] * 6,
+            },
             # Hygon's MV tuner includes the three input strides in its cache
             # key. Use a separate expand contract so generic MV backends keep
             # their existing two-key FlagTune schema.

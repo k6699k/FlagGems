@@ -37,6 +37,7 @@ _DEVICE_NAME = runtime_device.name
 _MUL_EXPAND_PATH = str(
     Path(__file__).resolve().parent.parent / "mul_ascend_expand.yaml"
 )
+_MUL_MAX_GRID = 65535
 
 _FALLBACK_KEYSET = torch._C.DispatchKeySet(
     torch._C.DispatchKey.CompositeExplicitAutograd
@@ -820,7 +821,7 @@ def _prune_mul_tiled_configs(configs, named_args, **kwargs):
         c
         for c in configs
         if triton.cdiv(m, c.kwargs["BLOCK_M"]) * triton.cdiv(n, c.kwargs["BLOCK_N"])
-        <= 65535
+        <= _MUL_MAX_GRID
         and c.kwargs["BLOCK_M"] * c.kwargs["BLOCK_N"] <= tile_limit
     ]
     if not pruned:
@@ -829,14 +830,6 @@ def _prune_mul_tiled_configs(configs, named_args, **kwargs):
 
 
 class _MulTiledTuner(LibTuner.get("flagtune")):
-    def __init__(self, *args, **kwargs):
-        """Bind the physical tiled kernel to its own model contract."""
-        kwargs.update(
-            flagtune_op_id="flaggems/mul",
-            flagtune_variant="broadcast_tiled",
-        )
-        super().__init__(*args, **kwargs)
-
     def policy(self, bench_fn, configs, args, kwargs):
         # Compilation failures must never win a wholly failed search.
         best, timings = super().policy(bench_fn, configs, args, kwargs)
@@ -864,6 +857,8 @@ class _MulTiledTuner(LibTuner.get("flagtune")):
     flagtune_op_name="mul",
     flagtune_expand_op_name="mul_broadcast_tiled",
     flagtune_yaml_path=_MUL_EXPAND_PATH,
+    flagtune_op_id="flaggems/mul",
+    flagtune_variant="broadcast_tiled",
 )
 @triton.jit
 def mul_broadcast_tiled_kernel(
@@ -925,13 +920,8 @@ def mul_broadcast_tiled_kernel(
         tl.store(out_ptr + rows[:, None] * N + cols[None, :], result, mask=valid)
 
 
-def _launch_2d_broadcast(
-    a_t, b_t, output, out_shape, a_stride, b_stride, out_stride, dtype
-):
-    n_elements = output.numel()
-    if n_elements == 0:
-        return output
-    if (
+def _can_use_tiled_broadcast(a_t, b_t, output, a_stride, b_stride, dtype):
+    return (
         output.device.type == "npu"
         and dtype in (torch.float16, torch.float32, torch.bfloat16)
         and a_t.dtype == b_t.dtype == output.dtype == dtype
@@ -939,65 +929,82 @@ def _launch_2d_broadcast(
         and all(s >= 0 for s in (*a_stride, *b_stride))
         and output.untyped_storage().data_ptr() != a_t.untyped_storage().data_ptr()
         and output.untyped_storage().data_ptr() != b_t.untyped_storage().data_ptr()
-    ):
-        MAX_CORE_DIM = 65535
+    )
+
+
+def _launch_narrow_outer(a_t, b_t, output, out_shape, a_stride, b_stride, block_m):
+    m, n = out_shape
+    row_on_lhs = a_stride[1] == 0
+    row, col = (a_t, b_t) if row_on_lhs else (b_t, a_t)
+    row_stride, col_stride = (
+        (a_stride[0], b_stride[1]) if row_on_lhs else (b_stride[0], a_stride[1])
+    )
+    with torch_device_fn.device(output.device):
+        mul_narrow_broadcast_kernel[(triton.cdiv(m, block_m),)](
+            row,
+            col,
+            output,
+            m,
+            N=n,
+            ROW_STRIDE=row_stride,
+            COL_STRIDE=col_stride,
+            BLOCK_M=block_m,
+            BLOCK_N=triton.next_power_of_2(n),
+            num_warps=4,
+            num_stages=1,
+        )
+    return output
+
+
+def _launch_tiled_broadcast(a_t, b_t, output, out_shape, a_stride, b_stride, dtype):
+    m, n = out_shape
+
+    # The tiled kernel loops over tiles when the launch grid is capped.
+    def grid(meta):
+        row_tiles = triton.cdiv(m, meta["BLOCK_M"])
+        col_tiles = triton.cdiv(n, meta["BLOCK_N"])
+        return (min(row_tiles * col_tiles, _MUL_MAX_GRID),)
+
+    with torch_device_fn.device(output.device):
+        mul_broadcast_tiled_kernel[grid](
+            a_t,
+            b_t,
+            output,
+            m,
+            n,
+            a_s0=a_stride[0],
+            a_s1=a_stride[1],
+            b_s0=b_stride[0],
+            b_s1=b_stride[1],
+            dtype=_dtype_name(dtype),
+        )
+    return output
+
+
+def _launch_2d_broadcast(
+    a_t, b_t, output, out_shape, a_stride, b_stride, out_stride, dtype
+):
+    n_elements = output.numel()
+    if n_elements == 0:
+        return output
+    if _can_use_tiled_broadcast(a_t, b_t, output, a_stride, b_stride, dtype):
+        m, n = out_shape
         outer = (a_stride[1] == 0 and b_stride[0] == 0) or (
             b_stride[1] == 0 and a_stride[0] == 0
         )
-        block_m = min(256, triton.next_power_of_2(out_shape[0]))
+        block_m = min(256, triton.next_power_of_2(m))
         # The narrow kernel has no grid-stride loop; use the tiled fallback
         # when its row grid would exceed the Ascend coreDim limit.
-        if (
-            out_shape[1] < 32
-            and outer
-            and triton.cdiv(out_shape[0], block_m) <= MAX_CORE_DIM
-        ):
-            row, col = (a_t, b_t) if a_stride[1] == 0 else (b_t, a_t)
-            row_stride, col_stride = (
-                (a_stride[0], b_stride[1])
-                if a_stride[1] == 0
-                else (b_stride[0], a_stride[1])
+        if n < 32 and outer and triton.cdiv(m, block_m) <= _MUL_MAX_GRID:
+            return _launch_narrow_outer(
+                a_t, b_t, output, out_shape, a_stride, b_stride, block_m
             )
-            with torch_device_fn.device(output.device):
-                mul_narrow_broadcast_kernel[(triton.cdiv(out_shape[0], block_m),)](
-                    row,
-                    col,
-                    output,
-                    out_shape[0],
-                    N=out_shape[1],
-                    ROW_STRIDE=row_stride,
-                    COL_STRIDE=col_stride,
-                    BLOCK_M=block_m,
-                    BLOCK_N=triton.next_power_of_2(out_shape[1]),
-                    num_warps=4,
-                    num_stages=1,
-                )
-            return output
+        return _launch_tiled_broadcast(
+            a_t, b_t, output, out_shape, a_stride, b_stride, dtype
+        )
 
-        # The tiled kernel loops over tiles when the launch grid is capped.
-        def compute_grid(meta):
-            row_tiles = triton.cdiv(out_shape[0], meta["BLOCK_M"])
-            col_tiles = triton.cdiv(out_shape[1], meta["BLOCK_N"])
-            total_tiles = row_tiles * col_tiles
-            return (min(total_tiles, MAX_CORE_DIM),)
-
-        with torch_device_fn.device(output.device):
-            mul_broadcast_tiled_kernel[compute_grid](
-                a_t,
-                b_t,
-                output,
-                out_shape[0],
-                out_shape[1],
-                a_s0=a_stride[0],
-                a_s1=a_stride[1],
-                b_s0=b_stride[0],
-                b_s1=b_stride[1],
-                dtype=_dtype_name(dtype),
-            )
-        return output
-    MAX_CORE_DIM = 65535
     grid = lambda meta: (
-        min(triton.cdiv(n_elements, meta["BLOCK_SIZE"]), MAX_CORE_DIM),
+        min(triton.cdiv(n_elements, meta["BLOCK_SIZE"]), _MUL_MAX_GRID),
     )
     with torch_device_fn.device(output.device):
         mul_broadcast_2d_kernel[grid](

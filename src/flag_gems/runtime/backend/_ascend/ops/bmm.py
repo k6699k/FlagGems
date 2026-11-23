@@ -355,25 +355,9 @@ def bmm_kernel(
         tl.store(o_ptrs, o, mask_c)
 
 
-def bmm(A, B):
-    logger.debug("GEMS_ASCEND BMM")
+def _launch_bmm_gemm(A, B, out):
     batch, M, K = A.shape
-    _, _, N = B.shape
-    A = A.contiguous()
-    out = torch.empty((batch, M, N), dtype=A.dtype, device=A.device)
-    route, tile = _select_bmm_route(A, B)
-    if route == "direct_nt":
-        return _launch_nt_gemm(A, B, out, tuner=bmm_tiled_kernel)
-    if route == "direct_nt_tiled":
-        return _launch_tiled_gemm(A, B, out, tile, tuner=bmm_direct_nt_kernel)
-    if route == "column_gemv":
-        return _launch_column_gemv(A, B, out, tuner=bmm_column_gemv_kernel)
-    if route == "narrow_gemv":
-        return _launch_narrow_gemv(A, B, out, tuner=bmm_narrow_gemv_kernel)
-    if route == "packed_rhs":
-        return _launch_narrow_pack(A, B, out)
-    if tile is not None:
-        return _launch_tiled_gemm(A, B, out, tile, tuner=bmm_tiled_kernel)
+    N = out.shape[-1]
     B = B.contiguous()
     dot_pad_only_k = (
         A.dtype == torch.bfloat16
@@ -405,25 +389,6 @@ def bmm(A, B):
     return out
 
 
-def _select_bmm_route(a, b):
-    if _use_nt_gemm(a, b):
-        return "direct_nt", None
-    if _use_column_gemv(a, b):
-        return "column_gemv", None
-    if _use_narrow_gemv(a, b):
-        return "narrow_gemv", None
-    if _use_narrow_pack(a, b):
-        return "packed_rhs", None
-    tile = _select_rectangular_tile(a, b)
-    if tile is not None:
-        return ("split_k" if tile[3] > 1 else "fixed_tile"), tile
-    tile = _select_direct_nt_tile(a, b)
-    if tile is not None:
-        return "direct_nt_tiled", tile
-    return "batched_gemm", None
-
-
-# Shared Ascend matmul fast paths for addmm, bmm, and baddbmm.
 def _can_use_dense_bf16_gemm(a, b):
     # Public callers materialize the LHS before dispatching either fast path.
     m, k = a.shape[-2:]
@@ -633,40 +598,33 @@ def _prune_tiled_gemm_configs(configs, named_args, **kwargs):
     args = {**named_args, **kwargs}
     m, n, k = (args[key] for key in ("M", "N", "K"))
     batch = args["BATCH"]
-    nt_bf16 = args["TRANSPOSED"] and args["A"].dtype == torch.bfloat16
+    dtype = args["A"].dtype
+    nt_bf16 = args["TRANSPOSED"] and dtype == torch.bfloat16
     is_910b = is_ascend_910b()
     prune_nt_tail = nt_bf16 and is_ascend_910c()
     # A large RHS tile with padding in both axes can fault in the bias path.
     prune_bias_tail = nt_bf16 and args["WITH_BIAS"]
-    return [
-        c
-        for c in configs
-        if c.kwargs["BM"] * c.kwargs["BN"] <= 32768
-        and batch * triton.cdiv(m, c.kwargs["BM"]) * triton.cdiv(n, c.kwargs["BN"])
-        <= 65535
-        and (not args["HINT"] or k % c.kwargs["BK"] == 0)
-        and not (prune_nt_tail and prune_910c_nt_column_tail(n, c.kwargs["BN"]))
-        and (
-            not (is_910b and prune_bias_tail)
-            or _nt_bias_tail_tile_fits_910b(n, c.kwargs["BN"], c.kwargs["BK"])
-        )
-        and (
-            not is_910b
-            or cube_tile_fits_910b(
-                c.kwargs["BM"],
-                c.kwargs["BN"],
-                c.kwargs["BK"],
-                args["A"].dtype.itemsize,
-                c.num_stages,
-            )
-        )
-        and not (
-            prune_bias_tail
-            and not masked_bias_rhs_fits_910b(
-                n, k, c.kwargs["BN"], c.kwargs["BK"], args["A"].dtype.itemsize
-            )
-        )
-    ]
+    valid = []
+    for config in configs:
+        bm, bn, bk = (config.kwargs[name] for name in ("BM", "BN", "BK"))
+        if bm * bn > 32768 or batch * triton.cdiv(m, bm) * triton.cdiv(n, bn) > 65535:
+            continue
+        if args["HINT"] and k % bk != 0:
+            continue
+        if prune_nt_tail and prune_910c_nt_column_tail(n, bn):
+            continue
+        if is_910b and prune_bias_tail and not _nt_bias_tail_tile_fits_910b(n, bn, bk):
+            continue
+        if is_910b and not cube_tile_fits_910b(
+            bm, bn, bk, dtype.itemsize, config.num_stages
+        ):
+            continue
+        if prune_bias_tail and not masked_bias_rhs_fits_910b(
+            n, k, bn, bk, dtype.itemsize
+        ):
+            continue
+        valid.append(config)
+    return valid
 
 
 def _prune_direct_nt_configs(configs, named_args, **kwargs):
@@ -712,7 +670,7 @@ class _TiledGemmTuner(AscendBlasTuner):
         return configs, strategy
 
 
-def _make_bmm_tiled_tuner(variant, prune):
+def _make_tiled_gemm_tuner(op_name, variant, prune):
     return libentry()(
         libtuner(
             configs=[
@@ -722,19 +680,21 @@ def _make_bmm_tiled_tuner(variant, prune):
             prune_configs_by={"early_config_prune": prune},
             use_cuda_graph=True,
             policy=_TiledGemmTuner,
-            flagtune_op_name="bmm",
-            flagtune_op_id="flaggems/bmm",
+            flagtune_op_name=op_name,
+            flagtune_op_id=f"flaggems/{op_name}",
             flagtune_variant=variant,
             flagtune_expand_op_name="tiled_gemm_ascend",
             flagtune_yaml_path=_TILED_EXPAND_PATH,
-            flagtune_dtype_resolver=gemm_dtype_resolver("bmm"),
+            flagtune_dtype_resolver=gemm_dtype_resolver(op_name),
         )(_tiled_gemm_kernel)
     )
 
 
-bmm_tiled_kernel = _make_bmm_tiled_tuner("tiled_gemm", _prune_tiled_gemm_configs)
-bmm_direct_nt_kernel = _make_bmm_tiled_tuner(
-    "direct_nt_tiled", _prune_direct_nt_configs
+bmm_tiled_kernel = _make_tiled_gemm_tuner(
+    "bmm", "tiled_gemm", _prune_tiled_gemm_configs
+)
+bmm_direct_nt_kernel = _make_tiled_gemm_tuner(
+    "bmm", "direct_nt_tiled", _prune_direct_nt_configs
 )
 
 
@@ -906,7 +866,7 @@ def _prune_column_gemv(configs, named_args, **kwargs):
     ]
 
 
-def _make_bmm_gemv_tuner(kernel, variant, prune):
+def _make_gemv_tuner(kernel, op_name, variant, prune):
     # BATCH is launch metadata and keeps distinct batch sizes in the tuning key.
     return libentry()(
         libtuner(
@@ -915,19 +875,19 @@ def _make_bmm_gemv_tuner(kernel, variant, prune):
             prune_configs_by={"early_config_prune": prune},
             use_cuda_graph=True,
             policy=AscendBlasTuner,
-            flagtune_op_name="bmm",
-            flagtune_op_id="flaggems/bmm",
+            flagtune_op_name=op_name,
+            flagtune_op_id=f"flaggems/{op_name}",
             flagtune_variant=variant,
             flagtune_expand_op_name=f"{variant}_ascend",
             flagtune_yaml_path=FIXED_GEMM_EXPAND_PATH,
-            flagtune_dtype_resolver=gemm_dtype_resolver("bmm"),
+            flagtune_dtype_resolver=gemm_dtype_resolver(op_name),
             disable_aabs=True,
         )(kernel)
     )
 
 
-bmm_column_gemv_kernel = _make_bmm_gemv_tuner(
-    _column_gemv_kernel, "column_gemv", _prune_column_gemv
+bmm_column_gemv_kernel = _make_gemv_tuner(
+    _column_gemv_kernel, "bmm", "column_gemv", _prune_column_gemv
 )
 
 
@@ -1000,8 +960,8 @@ def _prune_narrow_gemv(configs, named_args, **kwargs):
     ]
 
 
-bmm_narrow_gemv_kernel = _make_bmm_gemv_tuner(
-    _narrow_gemv_kernel, "narrow_gemv", _prune_narrow_gemv
+bmm_narrow_gemv_kernel = _make_gemv_tuner(
+    _narrow_gemv_kernel, "bmm", "narrow_gemv", _prune_narrow_gemv
 )
 
 
@@ -1064,3 +1024,42 @@ def _launch_narrow_pack(a, b, out, bias=None):
     with torch_device_fn.device(b.device):
         _pack_narrow_rhs[(k // 512, batch)](b, packed, n, k, 512, multibuffer=False)
     return _launch_nt_gemm(a, packed.transpose(-2, -1), out, bias, block_k=512)
+
+
+def _select_bmm_route(a, b):
+    if _use_nt_gemm(a, b):
+        return "direct_nt", None
+    if _use_column_gemv(a, b):
+        return "column_gemv", None
+    if _use_narrow_gemv(a, b):
+        return "narrow_gemv", None
+    if _use_narrow_pack(a, b):
+        return "packed_rhs", None
+    tile = _select_rectangular_tile(a, b)
+    if tile is not None:
+        return ("split_k" if tile[3] > 1 else "fixed_tile"), tile
+    tile = _select_direct_nt_tile(a, b)
+    if tile is not None:
+        return "direct_nt_tiled", tile
+    return "batched_gemm", None
+
+
+def bmm(A, B):
+    logger.debug("GEMS_ASCEND BMM")
+    batch, m, _ = A.shape
+    _, _, n = B.shape
+    A = A.contiguous()
+    out = torch.empty((batch, m, n), dtype=A.dtype, device=A.device)
+    route, tile = _select_bmm_route(A, B)
+    if route == "direct_nt":
+        return _launch_nt_gemm(A, B, out, tuner=bmm_tiled_kernel)
+    if tile is not None:
+        tuner = bmm_direct_nt_kernel if route == "direct_nt_tiled" else bmm_tiled_kernel
+        return _launch_tiled_gemm(A, B, out, tile, tuner=tuner)
+    if route == "column_gemv":
+        return _launch_column_gemv(A, B, out, tuner=bmm_column_gemv_kernel)
+    if route == "narrow_gemv":
+        return _launch_narrow_gemv(A, B, out, tuner=bmm_narrow_gemv_kernel)
+    if route == "packed_rhs":
+        return _launch_narrow_pack(A, B, out)
+    return _launch_bmm_gemm(A, B, out)

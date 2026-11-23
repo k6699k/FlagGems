@@ -28,10 +28,6 @@ from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as tle
 
 from .bmm import (
-    _TILED_EXPAND_PATH,
-    _TILED_KEY,
-    FIXED_GEMM_EXPAND_PATH,
-    AscendBlasTuner,
     ResourcePrunedGemmTuner,
     _column_gemv_kernel,
     _launch_column_gemv,
@@ -39,6 +35,8 @@ from .bmm import (
     _launch_narrow_pack,
     _launch_nt_gemm,
     _launch_tiled_gemm,
+    _make_gemv_tuner,
+    _make_tiled_gemm_tuner,
     _narrow_gemv_kernel,
     _prune_column_gemv,
     _prune_direct_nt_configs,
@@ -46,71 +44,14 @@ from .bmm import (
     _prune_tiled_gemm_configs,
     _select_direct_nt_tile,
     _select_rectangular_tile,
-    _tiled_gemm_kernel,
-    _TiledGemmTuner,
     _use_column_gemv,
     _use_narrow_gemv,
     _use_narrow_pack,
     _use_nt_gemm,
     bmm,
-    gemm_dtype_resolver,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _make_baddbmm_tiled_tuner(variant, prune):
-    return libentry()(
-        libtuner(
-            configs=[
-                triton.Config(dict(BM=16, BN=64, BK=128), num_warps=4, num_stages=2)
-            ],
-            key=_TILED_KEY,
-            prune_configs_by={"early_config_prune": prune},
-            use_cuda_graph=True,
-            policy=_TiledGemmTuner,
-            flagtune_op_name="baddbmm",
-            flagtune_op_id="flaggems/baddbmm",
-            flagtune_variant=variant,
-            flagtune_expand_op_name="tiled_gemm_ascend",
-            flagtune_yaml_path=_TILED_EXPAND_PATH,
-            flagtune_dtype_resolver=gemm_dtype_resolver("baddbmm"),
-        )(_tiled_gemm_kernel)
-    )
-
-
-def _make_baddbmm_gemv_tuner(kernel, variant, prune):
-    # BATCH is launch metadata and keeps distinct batch sizes in the tuning key.
-    return libentry()(
-        libtuner(
-            configs=[triton.Config({"BM": 8, "BK": 1024}, num_warps=4, num_stages=1)],
-            key=["M", "K", "WITH_BIAS", "BATCH"],
-            prune_configs_by={"early_config_prune": prune},
-            use_cuda_graph=True,
-            policy=AscendBlasTuner,
-            flagtune_op_name="baddbmm",
-            flagtune_op_id="flaggems/baddbmm",
-            flagtune_variant=variant,
-            flagtune_expand_op_name=f"{variant}_ascend",
-            flagtune_yaml_path=FIXED_GEMM_EXPAND_PATH,
-            flagtune_dtype_resolver=gemm_dtype_resolver("baddbmm"),
-            disable_aabs=True,
-        )(kernel)
-    )
-
-
-baddbmm_tiled_kernel = _make_baddbmm_tiled_tuner(
-    "tiled_gemm", _prune_tiled_gemm_configs
-)
-baddbmm_direct_nt_kernel = _make_baddbmm_tiled_tuner(
-    "direct_nt_tiled", _prune_direct_nt_configs
-)
-baddbmm_column_gemv_kernel = _make_baddbmm_gemv_tuner(
-    _column_gemv_kernel, "column_gemv", _prune_column_gemv
-)
-baddbmm_narrow_gemv_kernel = _make_baddbmm_gemv_tuner(
-    _narrow_gemv_kernel, "narrow_gemv", _prune_narrow_gemv
-)
 
 
 _BADDBMM_CONFIGS = runtime.get_tuned_config("baddbmm")
@@ -119,7 +60,7 @@ _BADDBMM_EXPAND_PATH = str(
 )
 
 
-def _prune_baddbmm_configs(configs, named_args, **kwargs):
+def _prune_baddbmm_default_configs(configs, named_args, **kwargs):
     if len(configs) > len(_BADDBMM_CONFIGS):
         return [
             c
@@ -164,32 +105,13 @@ def _prune_baddbmm_configs(configs, named_args, **kwargs):
     return selected or configs
 
 
-def _broadcast_strides(tensor, shape):
-    """Return strides for a broadcast view without materializing the output."""
-    if tensor.ndim > len(shape):
-        raise RuntimeError("bias cannot be broadcast to the baddbmm output shape")
-    padded_shape = (1,) * (len(shape) - tensor.ndim) + tuple(tensor.shape)
-    padded_strides = (0,) * (len(shape) - tensor.ndim) + tensor.stride()
-    strides = []
-    for source_size, source_stride, target_size in zip(
-        padded_shape, padded_strides, shape
-    ):
-        if source_size == target_size:
-            strides.append(source_stride)
-        elif source_size == 1:
-            strides.append(0)
-        else:
-            raise RuntimeError("bias cannot be broadcast to the baddbmm output shape")
-    return tuple(strides)
-
-
 def prune_910c_baddbmm_short_k(k, tile_k, stages):
     """Avoid 910C L0C conflicts when a pipelined K tile exceeds the reduction."""
     return stages >= 2 and tile_k > k
 
 
 class _BaddBMMFlagTuneTuner(ResourcePrunedGemmTuner):
-    default_prune = staticmethod(_prune_baddbmm_configs)
+    default_prune = staticmethod(_prune_baddbmm_default_configs)
     prune_910c_bf16 = staticmethod(prune_910c_baddbmm_short_k)
 
 
@@ -335,6 +257,83 @@ def baddbmm_kernel(
         tl.store(o_ptrs, o, mask=mask_c)
 
 
+def _broadcast_strides(tensor, shape):
+    """Return strides for a broadcast view without materializing the output."""
+    if tensor.ndim > len(shape):
+        raise RuntimeError("bias cannot be broadcast to the baddbmm output shape")
+    padded_shape = (1,) * (len(shape) - tensor.ndim) + tuple(tensor.shape)
+    padded_strides = (0,) * (len(shape) - tensor.ndim) + tensor.stride()
+    strides = []
+    for source_size, source_stride, target_size in zip(
+        padded_shape, padded_strides, shape
+    ):
+        if source_size == target_size:
+            strides.append(source_stride)
+        elif source_size == 1:
+            strides.append(0)
+        else:
+            raise RuntimeError("bias cannot be broadcast to the baddbmm output shape")
+    return tuple(strides)
+
+
+def _launch_baddbmm_gemm(bias, A, B, out, alpha, beta):
+    batch, M, K = A.shape
+    N = out.shape[-1]
+    bias_batch_stride, bias_M_stride, bias_N_stride = _broadcast_strides(
+        bias, out.shape
+    )
+    bias_is_vector = bias.ndim == 1 and bias.shape[0] == N
+    dot_pad_only_k = (
+        A.dtype == torch.bfloat16
+        and batch == 1
+        and M >= 256
+        and N >= 128
+        and N % 16 == 0
+        and K >= 128
+    )
+
+    grid = lambda meta: (
+        min(
+            triton.cdiv(M, meta["TILE_M"]) * triton.cdiv(N, meta["TILE_N"]) * batch,
+            65535,
+        ),
+    )
+    with torch_device_fn.device(A.device):
+        baddbmm_kernel[grid](
+            A,
+            B,
+            out,
+            bias,
+            alpha,
+            beta,
+            M,
+            N,
+            K,
+            BATCH=batch,
+            bias_batch_stride=bias_batch_stride,
+            bias_M_stride=bias_M_stride,
+            bias_N_stride=bias_N_stride,
+            DOT_PAD_ONLY_K=dot_pad_only_k,
+            BIAS_IS_VECTOR=bias_is_vector,
+            enable_auto_blockify=False,
+        )
+    return out
+
+
+baddbmm_tiled_kernel = _make_tiled_gemm_tuner(
+    "baddbmm", "tiled_gemm", _prune_tiled_gemm_configs
+)
+baddbmm_direct_nt_kernel = _make_tiled_gemm_tuner(
+    "baddbmm", "direct_nt_tiled", _prune_direct_nt_configs
+)
+baddbmm_column_gemv_kernel = _make_gemv_tuner(
+    _column_gemv_kernel, "baddbmm", "column_gemv", _prune_column_gemv
+)
+baddbmm_narrow_gemv_kernel = _make_gemv_tuner(
+    _narrow_gemv_kernel, "baddbmm", "narrow_gemv", _prune_narrow_gemv
+)
+
+
 def _dense_forward_tile(a, b):
     tile = _select_rectangular_tile(a, b, rectangular_nn=False)
     batch, m, k = a.shape
@@ -390,10 +389,11 @@ class BaddbmmFunction(torch.autograd.Function):
     def forward(ctx, bias, A, B, beta, alpha):
         logger.debug("GEMS_ASCEND BADDBMM_FORWARD")
 
-        batch, M, K = A.shape
+        batch, M, _ = A.shape
         _, _, N = B.shape
         A = A.contiguous()
         route, tile = _select_baddbmm_route(bias, A, B, alpha=alpha, beta=beta)
+        # Direct NT and tiled routes consume the original RHS strides.
         if route != "direct_nt" and tile is None:
             B = B.contiguous()
 
@@ -403,16 +403,17 @@ class BaddbmmFunction(torch.autograd.Function):
         out = torch.empty((batch, M, N), dtype=A.dtype, device=A.device)
         if route == "direct_nt":
             return _launch_nt_gemm(A, B, out, bias, tuner=baddbmm_tiled_kernel)
-        if route == "direct_nt_tiled":
-            return _launch_tiled_gemm(
-                A, B, out, tile, bias, tuner=baddbmm_direct_nt_kernel
+        if tile is not None:
+            tuner = (
+                baddbmm_direct_nt_kernel
+                if route == "direct_nt_tiled"
+                else baddbmm_tiled_kernel
             )
+            return _launch_tiled_gemm(A, B, out, tile, bias, tuner=tuner)
         if route == "column_gemv":
             return _launch_column_gemv(
                 A, B, out, bias, tuner=baddbmm_column_gemv_kernel
             )
-        if tile is not None:
-            return _launch_tiled_gemm(A, B, out, tile, bias, tuner=baddbmm_tiled_kernel)
         if route == "narrow_gemv":
             return _launch_narrow_gemv(
                 A, B, out, bias, tuner=baddbmm_narrow_gemv_kernel
@@ -420,45 +421,7 @@ class BaddbmmFunction(torch.autograd.Function):
         if route == "packed_rhs":
             return _launch_narrow_pack(A, B, out, bias)
 
-        bias_batch_stride, bias_M_stride, bias_N_stride = _broadcast_strides(
-            bias, (batch, M, N)
-        )
-        bias_is_vector = bias.ndim == 1 and bias.shape[0] == N
-        dot_pad_only_k = (
-            A.dtype == torch.bfloat16
-            and batch == 1
-            and M >= 256
-            and N >= 128
-            and N % 16 == 0
-            and K >= 128
-        )
-
-        grid = lambda meta: (
-            min(
-                triton.cdiv(M, meta["TILE_M"]) * triton.cdiv(N, meta["TILE_N"]) * batch,
-                65535,
-            ),
-        )
-        with torch_device_fn.device(A.device):
-            baddbmm_kernel[grid](
-                A,
-                B,
-                out,
-                bias,
-                alpha,
-                beta,
-                M,
-                N,
-                K,
-                BATCH=batch,
-                bias_batch_stride=bias_batch_stride,
-                bias_M_stride=bias_M_stride,
-                bias_N_stride=bias_N_stride,
-                DOT_PAD_ONLY_K=dot_pad_only_k,
-                BIAS_IS_VECTOR=bias_is_vector,
-                enable_auto_blockify=False,
-            )
-        return out
+        return _launch_baddbmm_gemm(bias, A, B, out, alpha, beta)
 
     @staticmethod
     def backward(ctx, grad_output):

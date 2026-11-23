@@ -130,6 +130,30 @@ def mv_kernel(
     tl.store(C_ptrs, acc[:, None], mask=n_mask)
 
 
+def _launch_general_mv(inp, vec, out):
+    n, k = inp.shape
+    max_rows = _MV_910B_MAX_ROWS if is_ascend_910b() else n
+    for start in range(0, n, max_rows):
+        rows = min(n - start, max_rows)
+        matrix, result = inp, out
+        if rows < n:
+            matrix = inp[start : start + rows]
+            result = out[start : start + rows]
+
+        grid = lambda meta: (triton.cdiv(rows, meta["BLOCK_N"]),)
+        mv_kernel[grid](
+            matrix,
+            vec,
+            result,
+            rows,
+            k,
+            inp.stride(0),
+            inp.stride(1),
+            vec.stride(0),
+            out.stride(0),
+        )
+
+
 @triton.jit
 def _mv_column_tiles(
     A,
@@ -191,6 +215,10 @@ def _mv_merge_column_tiles(
 
 _COLUMN_MIN_CHUNK = 128
 _COLUMN_MAX_BLOCK_N = 256
+_COLUMN_SPLIT_ROWS = 4096
+_COLUMN_SPLIT_BLOCK_N = 64
+_COLUMN_DIRECT_BLOCK_N = 128
+_COLUMN_DEFAULT_BLOCK_K = 128
 
 
 def _prune_column_mv_configs(configs, named_args, **kwargs):
@@ -214,7 +242,7 @@ def _prune_column_mv_configs(configs, named_args, **kwargs):
         elif block_n * block_k > (8192 if config.num_stages > 1 else 16384):
             continue
         splits = triton.cdiv(k, chunk) if split else 1
-        if triton.cdiv(n, block_n) * splits <= 65535:
+        if triton.cdiv(n, block_n) * splits <= _MV_MAX_GRID:
             candidates.append(config)
     return candidates
 
@@ -223,11 +251,18 @@ mv_column_kernel = libentry()(
     libtuner(
         configs=[
             triton.Config(
-                {"BLOCK_N": block_n, "BLOCK_K": 128, "CHUNK_K": chunk},
+                {
+                    "BLOCK_N": block_n,
+                    "BLOCK_K": _COLUMN_DEFAULT_BLOCK_K,
+                    "CHUNK_K": chunk,
+                },
                 num_warps=4,
                 num_stages=1,
             )
-            for block_n, chunk in ((64, _COLUMN_MIN_CHUNK), (128, 0))
+            for block_n, chunk in (
+                (_COLUMN_SPLIT_BLOCK_N, _COLUMN_MIN_CHUNK),
+                (_COLUMN_DIRECT_BLOCK_N, 0),
+            )
         ],
         key=["N", "K", "STRIDE_K", "STRIDE_X", "SPLIT"],
         prune_configs_by={"early_config_prune": _prune_column_mv_configs},
@@ -252,7 +287,8 @@ mv_column_kernel = libentry()(
 
 def _can_launch_column_mv(inp, vec):
     n, k = inp.shape
-    splits = triton.cdiv(k, _COLUMN_MIN_CHUNK) if n < 4096 else 1
+    splits = triton.cdiv(k, _COLUMN_MIN_CHUNK) if n < _COLUMN_SPLIT_ROWS else 1
+    block_n = _COLUMN_SPLIT_BLOCK_N if splits > 1 else _COLUMN_DIRECT_BLOCK_N
     return (
         n > 1
         and k >= 1024
@@ -261,16 +297,16 @@ def _can_launch_column_mv(inp, vec):
         and inp.dtype == vec.dtype
         and inp.dtype in (torch.float16, torch.bfloat16)
         and splits <= 128
-        and triton.cdiv(n, 64 if splits > 1 else 128) * splits <= 65535
+        and triton.cdiv(n, block_n) * splits <= _MV_MAX_GRID
         and n * k <= 2**31
         and (k - 1) * vec.stride(0) < 2**31
     )
 
 
 def _launch_column_mv(inp, vec, out, n, k):
-    split = int(n < 4096)
+    split = int(n < _COLUMN_SPLIT_ROWS)
     chunk = _COLUMN_MIN_CHUNK if split else 0
-    block_n = 64 if split else 128
+    block_n = _COLUMN_SPLIT_BLOCK_N if split else _COLUMN_DIRECT_BLOCK_N
     splits = triton.cdiv(k, chunk) if split else 1
     tune = (
         mv_column_kernel.fn._run_mode is not LibTunerRunMode.NORMAL
@@ -306,7 +342,7 @@ def _launch_column_mv(inp, vec, out, n, k):
             splits = triton.cdiv(k, selected["CHUNK_K"])
     else:
         _mv_column_tiles[(triton.cdiv(n, block_n) * splits,)](
-            *args, block_n, 128, chunk, num_warps=4, num_stages=1
+            *args, block_n, _COLUMN_DEFAULT_BLOCK_K, chunk, num_warps=4, num_stages=1
         )
     if split:
         _mv_merge_column_tiles[(triton.cdiv(n, 64),)](
@@ -337,24 +373,6 @@ def mv(inp, vec):
             inp, vec
         ):
             _launch_column_mv(inp, vec, out, N, M)
-            return out
-        max_rows = _MV_910B_MAX_ROWS if is_ascend_910b() else N
-        for start in range(0, N, max_rows):
-            rows = min(N - start, max_rows)
-            matrix, result = inp, out
-            if rows < N:
-                matrix = inp[start : start + rows]
-                result = out[start : start + rows]
-            grid = lambda meta: (triton.cdiv(rows, meta["BLOCK_N"]),)
-            mv_kernel[grid](
-                matrix,
-                vec,
-                result,
-                rows,
-                M,
-                inp.stride(0),
-                inp.stride(1),
-                vec.stride(0),
-                out.stride(0),
-            )
+        else:
+            _launch_general_mv(inp, vec, out)
     return out

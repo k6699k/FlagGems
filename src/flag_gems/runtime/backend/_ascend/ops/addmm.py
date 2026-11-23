@@ -26,33 +26,27 @@ from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
 from flag_gems.utils import broadcastable_to, libentry, libtuner
 
 from .bmm import (
-    _TILED_EXPAND_PATH,
-    _TILED_KEY,
     FIXED_GEMM_EXPAND_PATH,
     AscendBlasTuner,
     ResourcePrunedGemmTuner,
+    _blockified,
     _launch_narrow_gemv,
     _launch_narrow_pack,
     _launch_nt_gemm,
     _launch_tiled_gemm,
+    _make_gemv_tuner,
+    _make_tiled_gemm_tuner,
     _narrow_gemv_kernel,
     _prune_narrow_gemv,
     _prune_tiled_gemm_configs,
     _select_rectangular_tile,
-    _tiled_gemm_kernel,
-    _TiledGemmTuner,
     _use_narrow_gemv,
     _use_narrow_pack,
     _use_nt_gemm,
     gemm_dtype_resolver,
     is_ascend_910c,
 )
-from .mm import (
-    _blockified,
-    _mm_pack_wide_panels_kernel,
-    launch_panel_gemm,
-    prune_panel_gemm,
-)
+from .mm import _mm_pack_wide_panels_kernel, launch_panel_gemm, prune_panel_gemm
 
 logger = logging.getLogger(__name__)
 _MAX_ADDMM_PROGRAMS = 32768
@@ -60,36 +54,11 @@ _ADDMM_EXPAND_PATH = str(
     Path(__file__).resolve().parent.parent / "addmm_ascend_expand.yaml"
 )
 
-addmm_tiled_kernel = libentry()(
-    libtuner(
-        configs=[triton.Config(dict(BM=16, BN=64, BK=128), num_warps=4, num_stages=2)],
-        key=_TILED_KEY,
-        prune_configs_by={"early_config_prune": _prune_tiled_gemm_configs},
-        use_cuda_graph=True,
-        policy=_TiledGemmTuner,
-        flagtune_op_name="addmm",
-        flagtune_op_id="flaggems/addmm",
-        flagtune_variant="tiled_gemm",
-        flagtune_expand_op_name="tiled_gemm_ascend",
-        flagtune_yaml_path=_TILED_EXPAND_PATH,
-        flagtune_dtype_resolver=gemm_dtype_resolver("addmm"),
-    )(_tiled_gemm_kernel)
+addmm_tiled_kernel = _make_tiled_gemm_tuner(
+    "addmm", "tiled_gemm", _prune_tiled_gemm_configs
 )
-addmm_narrow_gemv_kernel = libentry()(
-    libtuner(
-        configs=[triton.Config({"BM": 8, "BK": 1024}, num_warps=4, num_stages=1)],
-        key=["M", "K", "WITH_BIAS", "BATCH"],
-        prune_configs_by={"early_config_prune": _prune_narrow_gemv},
-        use_cuda_graph=True,
-        policy=AscendBlasTuner,
-        flagtune_op_name="addmm",
-        flagtune_op_id="flaggems/addmm",
-        flagtune_variant="narrow_gemv",
-        flagtune_expand_op_name="narrow_gemv_ascend",
-        flagtune_yaml_path=FIXED_GEMM_EXPAND_PATH,
-        flagtune_dtype_resolver=gemm_dtype_resolver("addmm"),
-        disable_aabs=True,
-    )(_narrow_gemv_kernel)
+addmm_narrow_gemv_kernel = _make_gemv_tuner(
+    _narrow_gemv_kernel, "addmm", "narrow_gemv", _prune_narrow_gemv
 )
 
 
@@ -369,6 +338,93 @@ def addmm_kernel(
             tl.store(C_ptr, acc.to(C.dtype.element_ty), mask=mask)
 
 
+def _launch_addmm_gemm(bias, mat1, mat2, out, alpha, beta):
+    M, K = mat1.shape
+    N = mat2.shape[1]
+    # Align B row pitch when large NN GEMMs amortize the packing cost.
+    # Padding is outside the logical N and is never loaded by the masked kernel.
+    if (
+        mat1.dtype == torch.bfloat16
+        and mat1.stride(1) == 1
+        and mat2.stride(1) == 1
+        and mat2.stride(0) == N
+        and out.stride(1) == 1
+        and M >= 4096
+        and N >= 128
+        and K >= 512
+        and N % 256 != 0
+        and (N % 128 != 0 or K >= 4096)
+    ):
+        storage = torch.empty(
+            (K, triton.cdiv(N, 256) * 256), device=mat2.device, dtype=mat2.dtype
+        )
+        packed = storage[:, :N]
+        packed.copy_(mat2)
+        mat2 = packed
+
+    # Keep vector/scalar bias compact; broadcast strides cover other valid shapes.
+    bias_is_vector = bias.ndim == 1 and bias.shape[0] == N
+    bias_is_scalar = not bias_is_vector and bias.numel() == 1
+    if bias_is_vector:
+        bias_stride_m = 0
+        bias_stride_n = bias.stride(0)
+    elif bias_is_scalar:
+        bias_stride_m = 0
+        bias_stride_n = 0
+    else:
+        bias = bias.broadcast_to(out.shape)
+        bias_stride_m = bias.stride(0)
+        bias_stride_n = bias.stride(1)
+    dot_out_dtype = tl.float32
+
+    def _addmm_grid(META):
+        grid_m = triton.cdiv(M, META["BLOCK_M"])
+        grid_n = triton.cdiv(N, META["BLOCK_N"])
+        grid_2d = grid_m * grid_n
+        split_k = META.get("SPLIT_K", 1)
+        # Bound workspace across all tuning candidates, accounting for SPLIT_K.
+        capped_grid = min(grid_2d, _MAX_ADDMM_PROGRAMS // split_k)
+        return (capped_grid, split_k)
+
+    with torch_device_fn.device(mat1.device), _blockified():
+        addmm_kernel[_addmm_grid](
+            mat1,
+            mat2,
+            bias,
+            out,
+            alpha,
+            beta,
+            M,
+            N,
+            K,
+            mat1.stride(0),
+            mat1.stride(1),
+            mat2.stride(0),
+            mat2.stride(1),
+            bias_stride_m,
+            bias_stride_n,
+            out.stride(0),
+            out.stride(1),
+            dot_out_dtype=dot_out_dtype,
+            GROUP_M=8,
+            enable_auto_blockify=True,
+            BIAS_IS_VECTOR=bias_is_vector,
+            BIAS_IS_SCALAR=bias_is_scalar,
+            BETA_IS_ZERO=beta == 0,
+            DOT_PAD_ONLY_K=(
+                mat1.dtype in (torch.float16, torch.bfloat16)
+                and mat1.stride(1) == 1
+                and mat2.stride(1) == 1
+                and out.stride(1) == 1
+                and M >= 128
+                and N >= 128
+                and N % 16 == 0
+                and K > 0
+            ),
+        )
+    return out
+
+
 @libentry()
 @triton.jit
 def _addmm_small_mm(A, B, P, N: tl.constexpr, BM: tl.constexpr):
@@ -432,6 +488,41 @@ def _addmm_small_finish(
             else:
                 result += bias * beta
         tl.store(C + idx, result, idx < total_elements)
+
+
+def _launch_small_square_addmm(bias, mat1, mat2, out, alpha, beta):
+    M, N = out.shape
+    partial = torch.empty((M, N), dtype=torch.float32, device=mat1.device)
+    bm = 64 if N < 512 else 256
+    with torch_device_fn.device(mat1.device), _blockified():
+        _addmm_small_mm[(triton.cdiv(M, bm) * triton.cdiv(N, 128),)](
+            mat1,
+            mat2,
+            partial,
+            N,
+            bm,
+            enable_auto_blockify=True,
+            num_warps=4,
+            num_stages=2,
+        )
+        grid_size = min(triton.cdiv(M * N, 8192), 65535)
+        if alpha == 1 and beta == 1:
+            _addmm_small_add[(grid_size,)](
+                partial, bias, out, N, enable_auto_blockify=True
+            )
+        else:
+            _addmm_small_finish[(grid_size,)](
+                partial,
+                bias,
+                out,
+                alpha,
+                beta,
+                N,
+                UNIT=False,
+                BETA_IS_ZERO=beta == 0,
+                enable_auto_blockify=True,
+            )
+    return out
 
 
 @triton.jit
@@ -645,122 +736,8 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
         mat2 = mat2.contiguous()
 
     if route == "small_square":
-        partial = torch.empty((M, N), dtype=torch.float32, device=mat1.device)
-        bm = 64 if N < 512 else 256
-        MAX_CORE_DIM = 65535
-        with torch_device_fn.device(mat1.device), _blockified():
-            _addmm_small_mm[(triton.cdiv(M, bm) * triton.cdiv(N, 128),)](
-                mat1,
-                mat2,
-                partial,
-                N,
-                bm,
-                enable_auto_blockify=True,
-                num_warps=4,
-                num_stages=2,
-            )
-            if alpha == 1 and beta == 1:
-                grid_size = min(triton.cdiv(M * N, 8192), MAX_CORE_DIM)
-                _addmm_small_add[(grid_size,)](
-                    partial, bias, out, N, enable_auto_blockify=True
-                )
-            else:
-                grid_size = min(triton.cdiv(M * N, 8192), MAX_CORE_DIM)
-                _addmm_small_finish[(grid_size,)](
-                    partial,
-                    bias,
-                    out,
-                    alpha,
-                    beta,
-                    N,
-                    UNIT=False,
-                    BETA_IS_ZERO=beta == 0,
-                    enable_auto_blockify=True,
-                )
-        return out
-
-    # Align B row pitch when large NN GEMMs amortize the packing cost.
-    # Padding is outside the logical N and is never loaded by the masked kernel.
-    if (
-        mat1.dtype == torch.bfloat16
-        and mat1.stride(1) == 1
-        and mat2.stride(1) == 1
-        and mat2.stride(0) == N
-        and out.stride(1) == 1
-        and M >= 4096
-        and N >= 128
-        and K >= 512
-        and N % 256 != 0
-        and (N % 128 != 0 or K >= 4096)
-    ):
-        storage = torch.empty(
-            (K, triton.cdiv(N, 256) * 256), device=mat2.device, dtype=mat2.dtype
-        )
-        packed = storage[:, :N]
-        packed.copy_(mat2)
-        mat2 = packed
-
-    # Keep vector/scalar bias compact; broadcast strides cover other valid shapes.
-    bias_is_vector = bias.ndim == 1 and bias.shape[0] == N
-    bias_is_scalar = not bias_is_vector and bias.numel() == 1
-    if bias_is_vector:
-        bias_stride_m = 0
-        bias_stride_n = bias.stride(0)
-    elif bias_is_scalar:
-        bias_stride_m = 0
-        bias_stride_n = 0
-    else:
-        bias = bias.broadcast_to(out.shape)
-        bias_stride_m = bias.stride(0)
-        bias_stride_n = bias.stride(1)
-    dot_out_dtype = tl.float32
-
-    def _addmm_grid(META):
-        grid_m = triton.cdiv(M, META["BLOCK_M"])
-        grid_n = triton.cdiv(N, META["BLOCK_N"])
-        grid_2d = grid_m * grid_n
-        split_k = META.get("SPLIT_K", 1)
-        # Bound workspace across all tuning candidates, accounting for SPLIT_K.
-        capped_grid = min(grid_2d, _MAX_ADDMM_PROGRAMS // split_k)
-        return (capped_grid, split_k)
-
-    with torch_device_fn.device(mat1.device), _blockified():
-        addmm_kernel[_addmm_grid](
-            mat1,
-            mat2,
-            bias,
-            out,
-            alpha,
-            beta,
-            M,
-            N,
-            K,
-            mat1.stride(0),
-            mat1.stride(1),
-            mat2.stride(0),
-            mat2.stride(1),
-            bias_stride_m,
-            bias_stride_n,
-            out.stride(0),
-            out.stride(1),
-            dot_out_dtype=dot_out_dtype,
-            GROUP_M=8,
-            enable_auto_blockify=True,
-            BIAS_IS_VECTOR=bias_is_vector,
-            BIAS_IS_SCALAR=bias_is_scalar,
-            BETA_IS_ZERO=beta == 0,
-            DOT_PAD_ONLY_K=(
-                mat1.dtype in (torch.float16, torch.bfloat16)
-                and mat1.stride(1) == 1
-                and mat2.stride(1) == 1
-                and out.stride(1) == 1
-                and M >= 128
-                and N >= 128
-                and N % 16 == 0
-                and K > 0
-            ),
-        )
-    return out
+        return _launch_small_square_addmm(bias, mat1, mat2, out, alpha, beta)
+    return _launch_addmm_gemm(bias, mat1, mat2, out, alpha, beta)
 
 
 def addmm(bias, mat1, mat2, *, beta=1, alpha=1):
