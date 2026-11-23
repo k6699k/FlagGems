@@ -183,6 +183,7 @@ class TunedConfigLoader(object):
                 "mm_rectangular_ascend": ("BLOCK_M", "BLOCK_N", "BLOCK_K"),
                 "mm_packed_narrow_ascend": ("BM", "BK"),
                 "panel_gemm_ascend": ("BM", "BK"),
+                "router_gemm_ascend": ("BM", "BN", "BK"),
             }.get(op_name)
         if fields is not None:
             return [
@@ -1109,6 +1110,11 @@ class TunedConfigLoader(object):
                 "yaml_op_name": "tiled_gemm_ascend",
                 "key": ["BATCH", "M", "N", "K", "TRANSPOSED", "WITH_BIAS", "HINT"],
                 "default_strategy": ["default"] * 7,
+            },
+            "router_gemm_ascend": {
+                "key": ["M", "N", "K", "XM", "XK", "WN", "WK", "SPLIT"],
+                "default_strategy": ["default"] * 8,
+                "expand_yaml_path": self._get_expand_config_path("router_gemm"),
             },
             "bmm_ascend": {
                 "yaml_op_name": "bmm_ascend",

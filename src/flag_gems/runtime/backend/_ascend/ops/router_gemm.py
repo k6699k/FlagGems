@@ -12,12 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import torch
 import triton
 import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.runtime.flagtune import register_flagtune_op
+from flag_gems.utils import libentry, libtuner
+
+from .bmm import AscendBlasTuner, cube_tile_fits_910b, tune_fixed_gemm
+
+EXPAND_CONFIG_FILENAME = str(
+    Path(__file__).resolve().parent.parent / "router_gemm_ascend_expand.yaml"
+)
+register_flagtune_op("router_gemm", default=False, description="router matrix multiply")
 
 
 @libentry()
@@ -118,22 +128,10 @@ def _router_reduce(P, Y, SIZE: tl.constexpr, SPLIT: tl.constexpr, BLOCK: tl.cons
     tl.store(Y + i, value, i < SIZE)
 
 
-def router_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Compute router scores with FP32 accumulation and output."""
-    if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1]:
-        raise ValueError("router_gemm expects x[M, K] and weight[N, K]")
-    if x.device != weight.device or x.dtype != weight.dtype:
-        raise ValueError("router_gemm inputs must have the same device and dtype")
-    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise ValueError("router_gemm supports float16, bfloat16 and float32")
+def _router_plan(x, weight):
     M, K = x.shape
     N = weight.shape[0]
-    out = torch.empty((M, N), dtype=torch.float32, device=x.device)
-    if M == 0 or N == 0:
-        return out
-    size = M * N
     weight_strides = weight.stride()
-    strides = (*x.stride(), *weight_strides)
     dense_nn = N % 16 == 0 and weight_strides == (1, N)
     low_precision = x.dtype in (torch.float16, torch.bfloat16)
     small_short_k_nt = (
@@ -157,57 +155,128 @@ def router_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         or weight.data_ptr() % 16 != 0
     )
     small_nt = M == 1 and not (dense_nn or wide_bf16_nt or small_short_k_nt)
+    if vector_fallback or ((small_nt or (M <= 16 and N <= 8)) and K <= 8192):
+        block_k = max(1, triton.next_power_of_2(K))
+        return None, min(1024, block_k) if vector_fallback else block_k
+
+    if small_short_k_nt:
+        # Narrow N tiles expose parallel work without splitting K.
+        bm, bn, bk = 16, 32, 512
+    elif medium_short_k:
+        bm, bn, bk = (64, 128, 256) if dense_nn else (128, 64, 512)
+    elif low_precision and M >= 8192 and N <= 384 and N % 64 == 0 and K % 256 == 0:
+        bm, bn, bk = 256, min(N, 128), 256
+        if dense_nn:
+            if K == 2048 and N % 256 == 0:
+                bm, bn = 128, 256
+            elif N < 256:
+                bm = 128
+    elif wide_bf16_nt:
+        bm, bn, bk = min(128, max(16, triton.next_power_of_2(M))), 128, 512
+    elif dense_nn:
+        bm = 16 if M <= 16 else 32 if M < 128 else 128
+        bn, bk = min(triton.next_power_of_2(N), 128), 256
+    else:
+        bm = 16 if M <= 32 else 32 if M < 128 else 64
+        bn, bk = (16 if N <= 16 else 64), 128
+
+    tiles = triton.cdiv(M, bm) * triton.cdiv(N, bn)
+    # Target 20 output tasks on 910B, with at most eight K partitions.
+    split = (
+        min(8, triton.next_power_of_2(triton.cdiv(20, tiles)))
+        if K >= 2048 and not (small_short_k_nt or medium_short_k)
+        else 1
+    )
+    # Avoid masked or empty K partitions in the matrix pipeline.
+    while bk > 128 and K % (bk * split) != 0:
+        bk //= 2
+    while split > 1 and K % (bk * split) != 0:
+        split //= 2
+    return (bm, bn, bk, split), None
+
+
+def _can_tune_router_cube(m, n, split):
+    # The smallest tile is a legal fallback for every shape in the search.
+    return triton.cdiv(m, 16) * triton.cdiv(n, 16) * split <= 65535
+
+
+def _prune_router_cube_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    m, n, k, split = (args[name] for name in ("M", "N", "K", "SPLIT"))
+    max_m = max(16, triton.next_power_of_2(m))
+    max_n = max(16, triton.next_power_of_2(n))
+    element_bytes = args["X"].dtype.itemsize
+    valid = []
+    for config in configs:
+        bm, bn, bk = (config.kwargs[name] for name in ("BM", "BN", "BK"))
+        if bm > max_m or bn > max_n or k % (bk * split):
+            continue
+        if cube_tile_fits_910b(bm, bn, bk, element_bytes, config.num_stages):
+            valid.append(config)
+    return valid
+
+
+router_cube_tuned = libentry()(
+    libtuner(
+        configs=[triton.Config({"BM": 16, "BN": 16, "BK": 128}, num_stages=1)],
+        key=["M", "N", "K", "XM", "XK", "WN", "WK", "SPLIT"],
+        prune_configs_by={"early_config_prune": _prune_router_cube_configs},
+        use_cuda_graph=True,
+        disable_aabs=True,
+        policy=AscendBlasTuner,
+        flagtune_op_name="router_gemm",
+        flagtune_op_id="flaggems/router_gemm",
+        flagtune_variant="cube",
+        flagtune_expand_op_name="router_gemm_ascend",
+        flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+        flagtune_dtype_resolver=lambda args: tuple(
+            args[k].dtype for k in ("X", "W", "Y")
+        ),
+    )(_router_cube.jit_function)
+)
+
+
+def router_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Compute router scores with FP32 accumulation and output."""
+    if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1]:
+        raise ValueError("router_gemm expects x[M, K] and weight[N, K]")
+    if x.device != weight.device or x.dtype != weight.dtype:
+        raise ValueError("router_gemm inputs must have the same device and dtype")
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("router_gemm supports float16, bfloat16 and float32")
+    m, k = x.shape
+    n = weight.shape[0]
+    out = torch.empty((m, n), dtype=torch.float32, device=x.device)
+    if m == 0 or n == 0:
+        return out
+    size = m * n
+    strides = (*x.stride(), *weight.stride())
     with torch_device_fn.device(x.device):
-        if vector_fallback or ((small_nt or (M <= 16 and N <= 8)) and K <= 8192):
-            block_k = max(1, triton.next_power_of_2(K))
-            if vector_fallback:
-                block_k = min(1024, block_k)
+        tile, vector_block_k = _router_plan(x, weight)
+        if tile is None:
             # Ascend launch dimensions must fit in 16 bits.
             grid = size if size <= 65535 else 4096
-            _router_vector[(grid,)](x, weight, out, N, K, *strides, block_k, size, grid)
+            _router_vector[(grid,)](
+                x, weight, out, n, k, *strides, vector_block_k, size, grid
+            )
             return out
 
-        if small_short_k_nt:
-            # Narrow N tiles expose parallel work without splitting K.
-            bm, bn, bk = 16, 32, 512
-        elif medium_short_k:
-            bm, bn, bk = (64, 128, 256) if dense_nn else (128, 64, 512)
-        elif low_precision and M >= 8192 and N <= 384 and N % 64 == 0 and K % 256 == 0:
-            bm, bn, bk = 256, min(N, 128), 256
-            if dense_nn:
-                if K == 2048 and N % 256 == 0:
-                    bm, bn = 128, 256
-                elif N < 256:
-                    bm = 128
-        elif wide_bf16_nt:
-            bm, bn, bk = min(128, max(16, triton.next_power_of_2(M))), 128, 512
-        elif dense_nn:
-            bm = 16 if M <= 16 else 32 if M < 128 else 128
-            bn, bk = min(triton.next_power_of_2(N), 128), 256
-        else:
-            bm = 16 if M <= 32 else 32 if M < 128 else 64
-            bn, bk = (16 if N <= 16 else 64), 128
-
-        tiles = triton.cdiv(M, bm) * triton.cdiv(N, bn)
-        # Target 20 output tasks on 910B, with at most eight K partitions.
-        split = (
-            min(8, triton.next_power_of_2(triton.cdiv(20, tiles)))
-            if K >= 2048 and not (small_short_k_nt or medium_short_k)
-            else 1
-        )
-        # Avoid masked or empty K partitions in the matrix pipeline.
-        while bk > 128 and K % (bk * split) != 0:
-            bk //= 2
-        while split > 1 and K % (bk * split) != 0:
-            split //= 2
+        bm, bn, bk, split = tile
         partial = (
-            torch.empty((split, M, N), device=x.device, dtype=torch.float32)
+            torch.empty((split, m, n), device=x.device, dtype=torch.float32)
             if split > 1
             else out
         )
-        _router_cube[(tiles, split)](
-            x, weight, partial, M, N, K, *strides, bm, bn, bk, split
-        )
+        args = (x, weight, partial, m, n, k, *strides)
+        if _can_tune_router_cube(m, n, split) and tune_fixed_gemm(router_cube_tuned):
+
+            def grid(meta):
+                return (triton.cdiv(m, meta["BM"]) * triton.cdiv(n, meta["BN"]), split)
+
+            router_cube_tuned[grid](*args, SPLIT=split)
+        else:
+            tiles = triton.cdiv(m, bm) * triton.cdiv(n, bn)
+            _router_cube[(tiles, split)](*args, bm, bn, bk, split)
         if split > 1:
             _router_reduce[(triton.cdiv(size, 1024),)](partial, out, size, split, 1024)
     return out

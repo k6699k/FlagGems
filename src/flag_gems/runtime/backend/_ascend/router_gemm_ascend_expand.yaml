@@ -1,0 +1,35 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+router_gemm_ascend:
+  - config:
+    param_map: &cube_params
+      META: {BM: bm, BN: bn, BK: bk}
+      num_stages: stages
+      num_warps: warps
+    bm: [16, 32]
+    bn: [16, 32, 64]
+    bk: [128, 256, 512]
+    stages: &stages [1, 2]
+    warps: &warps [4]
+  - config:
+    param_map: *cube_params
+    bm: [64]
+    bn: [16, 32, 64, 128]
+    bk: [128, 256, 512]
+    stages: *stages
+    warps: *warps
+  - config:
+    param_map: *cube_params
+    bm: [128]
+    bn: [32, 64, 128]
+    bk: [128, 256]
+    stages: *stages
+    warps: *warps
+  - config:
+    param_map: *cube_params
+    bm: [16, 32]
+    bn: [128]
+    bk: [128, 256]
+    stages: *stages
+    warps: *warps
