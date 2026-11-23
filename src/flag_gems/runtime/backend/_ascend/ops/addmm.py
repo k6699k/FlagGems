@@ -26,7 +26,6 @@ from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
 from flag_gems.utils import broadcastable_to, libentry, libtuner
 
 from .bmm import (
-    FIXED_GEMM_EXPAND_PATH,
     AscendBlasTuner,
     ResourcePrunedGemmTuner,
     _blockified,
@@ -55,10 +54,14 @@ _ADDMM_EXPAND_PATH = str(
 )
 
 addmm_tiled_kernel = _make_tiled_gemm_tuner(
-    "addmm", "tiled_gemm", _prune_tiled_gemm_configs
+    "addmm", "tiled_gemm", _prune_tiled_gemm_configs, yaml_path=_ADDMM_EXPAND_PATH
 )
 addmm_narrow_gemv_kernel = _make_gemv_tuner(
-    _narrow_gemv_kernel, "addmm", "narrow_gemv", _prune_narrow_gemv
+    _narrow_gemv_kernel,
+    "addmm",
+    "narrow_gemv",
+    _prune_narrow_gemv,
+    yaml_path=_ADDMM_EXPAND_PATH,
 )
 
 
@@ -586,7 +589,7 @@ addmm_wide_panel_kernel = libentry()(
         flagtune_op_id="flaggems/addmm",
         flagtune_variant="wide_panels",
         flagtune_expand_op_name="panel_gemm_ascend",
-        flagtune_yaml_path=FIXED_GEMM_EXPAND_PATH,
+        flagtune_yaml_path=_ADDMM_EXPAND_PATH,
         flagtune_dtype_resolver=gemm_dtype_resolver("addmm", rhs="Packed"),
         disable_aabs=True,
     )(_addmm_wide_panel_kernel)

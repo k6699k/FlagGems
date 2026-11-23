@@ -84,3 +84,76 @@ addmm_ascend:
     warps: *mm_warps
 
   - strategy: {M: default, N: default, K: default, stride_am: default, stride_ak: default, stride_bk: default, stride_bn: default, stride_im: default, stride_in: default, stride_cm: default, stride_cn: default, BIAS_IS_VECTOR: default, BIAS_IS_SCALAR: default, DOT_PAD_ONLY_K: default}
+
+narrow_gemv_ascend:
+  - config:
+    param_map: &gemm_bm_bk
+      META: {BM: bm, BK: bk}
+      num_stages: stages
+      num_warps: warps
+    bm: [1, 2, 4, 8]
+    bk: [64, 128, 256, 512, 1024]
+    stages: &gemm_one_stage [1]
+    warps: &gemm_warps [4]
+
+panel_gemm_ascend:
+  - config:
+    param_map: *gemm_bm_bk
+    bm: [16, 32, 64, 128]
+    bk: [64, 128, 256]
+    stages: [1, 2]
+    warps: *gemm_warps
+
+tiled_gemm_ascend:
+  - config:
+    param_map: &tiled_params
+      META: {BM: bm, BN: bn, BK: bk}
+      num_stages: stages
+      num_warps: warps
+    bm: [16, 32]
+    bn: [16, 32, 64]
+    bk: [64, 128, 256]
+    stages: &tiled_stages [1, 2]
+    warps: &tiled_warps [4]
+  - config:
+    param_map: *tiled_params
+    bm: [64]
+    bn: [32, 64]
+    bk: [64, 128, 256]
+    stages: *tiled_stages
+    warps: *tiled_warps
+  - config:
+    param_map: *tiled_params
+    bm: [16, 32, 64]
+    bn: [64, 128]
+    bk: [256, 512]
+    stages: *tiled_stages
+    warps: *tiled_warps
+  - config:
+    param_map: *tiled_params
+    bm: [128]
+    bn: [128, 256]
+    bk: [128, 256]
+    stages: *tiled_stages
+    warps: *tiled_warps
+  - config:
+    param_map: *tiled_params
+    bm: [32, 64]
+    bn: [256]
+    bk: [128, 256]
+    stages: *tiled_stages
+    warps: *tiled_warps
+  - config:
+    param_map: *tiled_params
+    bm: [256]
+    bn: [128]
+    bk: [256]
+    stages: *tiled_stages
+    warps: *tiled_warps
+  - config:
+    param_map: *tiled_params
+    bm: [16]
+    bn: [512]
+    bk: [128]
+    stages: *tiled_stages
+    warps: *tiled_warps

@@ -321,16 +321,27 @@ def _launch_baddbmm_gemm(bias, A, B, out, alpha, beta):
 
 
 baddbmm_tiled_kernel = _make_tiled_gemm_tuner(
-    "baddbmm", "tiled_gemm", _prune_tiled_gemm_configs
+    "baddbmm", "tiled_gemm", _prune_tiled_gemm_configs, yaml_path=_BADDBMM_EXPAND_PATH
 )
 baddbmm_direct_nt_kernel = _make_tiled_gemm_tuner(
-    "baddbmm", "direct_nt_tiled", _prune_direct_nt_configs
+    "baddbmm",
+    "direct_nt_tiled",
+    _prune_direct_nt_configs,
+    yaml_path=_BADDBMM_EXPAND_PATH,
 )
 baddbmm_column_gemv_kernel = _make_gemv_tuner(
-    _column_gemv_kernel, "baddbmm", "column_gemv", _prune_column_gemv
+    _column_gemv_kernel,
+    "baddbmm",
+    "column_gemv",
+    _prune_column_gemv,
+    yaml_path=_BADDBMM_EXPAND_PATH,
 )
 baddbmm_narrow_gemv_kernel = _make_gemv_tuner(
-    _narrow_gemv_kernel, "baddbmm", "narrow_gemv", _prune_narrow_gemv
+    _narrow_gemv_kernel,
+    "baddbmm",
+    "narrow_gemv",
+    _prune_narrow_gemv,
+    yaml_path=_BADDBMM_EXPAND_PATH,
 )
 
 

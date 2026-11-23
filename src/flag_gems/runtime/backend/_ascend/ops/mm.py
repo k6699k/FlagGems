@@ -27,7 +27,6 @@ from flag_gems.utils import libentry, libtuner
 from flag_gems.utils.libentry import LibTunerRunMode
 
 from .bmm import (
-    FIXED_GEMM_EXPAND_PATH,
     AscendBlasTuner,
     _blockified,
     _launch_tiled_gemm,
@@ -896,7 +895,7 @@ def _make_mm_fixed_tuner(kernel, variant, key, preset, prune, space, *, stages=2
             flagtune_op_id="flaggems/mm",
             flagtune_variant=variant,
             flagtune_expand_op_name=f"{space}_ascend",
-            flagtune_yaml_path=FIXED_GEMM_EXPAND_PATH,
+            flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
             disable_aabs=True,
         )(kernel)
     )
@@ -936,7 +935,7 @@ mm_packed_narrow_nt_kernel = _make_mm_fixed_tuner(
     "mm_packed_narrow",
 )
 mm_direct_nt_kernel = _make_tiled_gemm_tuner(
-    "mm", "direct_nt_tiled", _prune_direct_nt_configs
+    "mm", "direct_nt_tiled", _prune_direct_nt_configs, yaml_path=EXPAND_CONFIG_FILENAME
 )
 mm_wide_panel_kernel = _make_mm_fixed_tuner(
     _mm_wide_panel_cube_kernel,

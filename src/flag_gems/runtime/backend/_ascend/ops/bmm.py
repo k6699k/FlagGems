@@ -37,9 +37,6 @@ _BMM_CONFIGS = runtime.get_tuned_config("bmm")
 _BMM_EXPAND_PATH = str(
     Path(__file__).resolve().parent.parent / "bmm_ascend_expand.yaml"
 )
-FIXED_GEMM_EXPAND_PATH = str(
-    Path(__file__).parent.parent / "fixed_gemm_ascend_expand.yaml"
-)
 
 # CANN 9.1 platform_config/Ascend910B4-1.ini, AICoreSpec.
 _L0B_BYTES = 64 * 1024
@@ -570,9 +567,6 @@ def _finish_split_gemm(
     tl.store(Out + offset, value, offset < TOTAL)
 
 
-_TILED_EXPAND_PATH = str(
-    Path(__file__).resolve().parent.parent / "tiled_gemm_ascend_expand.yaml"
-)
 _TILED_KEY = ["BATCH", "M", "N", "K", "TRANSPOSED", "WITH_BIAS", "HINT"]
 _NT_BIAS_TAIL_MAX_BK_910B = 128
 
@@ -670,7 +664,7 @@ class _TiledGemmTuner(AscendBlasTuner):
         return configs, strategy
 
 
-def _make_tiled_gemm_tuner(op_name, variant, prune):
+def _make_tiled_gemm_tuner(op_name, variant, prune, *, yaml_path):
     return libentry()(
         libtuner(
             configs=[
@@ -684,17 +678,17 @@ def _make_tiled_gemm_tuner(op_name, variant, prune):
             flagtune_op_id=f"flaggems/{op_name}",
             flagtune_variant=variant,
             flagtune_expand_op_name="tiled_gemm_ascend",
-            flagtune_yaml_path=_TILED_EXPAND_PATH,
+            flagtune_yaml_path=yaml_path,
             flagtune_dtype_resolver=gemm_dtype_resolver(op_name),
         )(_tiled_gemm_kernel)
     )
 
 
 bmm_tiled_kernel = _make_tiled_gemm_tuner(
-    "bmm", "tiled_gemm", _prune_tiled_gemm_configs
+    "bmm", "tiled_gemm", _prune_tiled_gemm_configs, yaml_path=_BMM_EXPAND_PATH
 )
 bmm_direct_nt_kernel = _make_tiled_gemm_tuner(
-    "bmm", "direct_nt_tiled", _prune_direct_nt_configs
+    "bmm", "direct_nt_tiled", _prune_direct_nt_configs, yaml_path=_BMM_EXPAND_PATH
 )
 
 
@@ -866,7 +860,7 @@ def _prune_column_gemv(configs, named_args, **kwargs):
     ]
 
 
-def _make_gemv_tuner(kernel, op_name, variant, prune):
+def _make_gemv_tuner(kernel, op_name, variant, prune, *, yaml_path):
     # BATCH is launch metadata and keeps distinct batch sizes in the tuning key.
     return libentry()(
         libtuner(
@@ -879,7 +873,7 @@ def _make_gemv_tuner(kernel, op_name, variant, prune):
             flagtune_op_id=f"flaggems/{op_name}",
             flagtune_variant=variant,
             flagtune_expand_op_name=f"{variant}_ascend",
-            flagtune_yaml_path=FIXED_GEMM_EXPAND_PATH,
+            flagtune_yaml_path=yaml_path,
             flagtune_dtype_resolver=gemm_dtype_resolver(op_name),
             disable_aabs=True,
         )(kernel)
@@ -887,7 +881,11 @@ def _make_gemv_tuner(kernel, op_name, variant, prune):
 
 
 bmm_column_gemv_kernel = _make_gemv_tuner(
-    _column_gemv_kernel, "bmm", "column_gemv", _prune_column_gemv
+    _column_gemv_kernel,
+    "bmm",
+    "column_gemv",
+    _prune_column_gemv,
+    yaml_path=_BMM_EXPAND_PATH,
 )
 
 
@@ -961,7 +959,11 @@ def _prune_narrow_gemv(configs, named_args, **kwargs):
 
 
 bmm_narrow_gemv_kernel = _make_gemv_tuner(
-    _narrow_gemv_kernel, "bmm", "narrow_gemv", _prune_narrow_gemv
+    _narrow_gemv_kernel,
+    "bmm",
+    "narrow_gemv",
+    _prune_narrow_gemv,
+    yaml_path=_BMM_EXPAND_PATH,
 )
 
 
