@@ -9,7 +9,7 @@ mv_ascend:
     block_n: [1, 2, 4, 8, 16, 32, 64, 128]
     stages: [1, 2, 3]
     warps: [4]
-  - strategy: {M: align32, N: align32, stride_an: default, stride_am: default, stride_bm: default, stride_cn: default}
+  - strategy: {M: default, N: default, stride_an: default, stride_am: default, stride_bm: default, stride_cn: default}
 
 mv_column_ascend:
   - config:

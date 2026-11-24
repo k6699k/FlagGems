@@ -24,10 +24,9 @@ from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
 from flag_gems.utils import libentry, libtuner
-from flag_gems.utils.libentry import LibTunerRunMode
+from flag_gems.utils.libentry import LibTuner
 
 from .bmm import (
-    AscendBlasTuner,
     _blockified,
     _launch_tiled_gemm,
     _make_tiled_gemm_tuner,
@@ -37,7 +36,6 @@ from .bmm import (
     is_ascend_910b,
     is_ascend_910c,
     prune_cube_tiles_910b,
-    tune_fixed_gemm,
     vector_tile_fits_910b,
 )
 from .copy import copy as copy_tensor
@@ -130,7 +128,7 @@ def _prune_mm_configs(configs, named_args, **kwargs):
     return candidates
 
 
-class _MMFlagTuneTuner(AscendBlasTuner):
+class _MMFlagTuneTuner(LibTuner.get("flagtune")):
     def __init__(self, *args, **kwargs):
         kwargs["prune_configs_by"] = {"early_config_prune": self._prune_candidates}
         super().__init__(*args, **kwargs)
@@ -144,17 +142,10 @@ class _MMFlagTuneTuner(AscendBlasTuner):
                 args["A"].dtype,
                 ("BLOCK_M", "BLOCK_N", "BLOCK_K"),
             )
-            if (
-                self._flagtune_mode is runtime.TuningMode.DEFAULT
-                and self._run_mode is not LibTunerRunMode.EXHAUSTIVE_COLLECTION
-            ):
+            if self.uses_default_pruning:
                 return _prune_mm_configs(valid, named_args, **kwargs)
             return valid
-        if (
-            self._flagtune_mode is runtime.TuningMode.DEFAULT
-            and getattr(self, "_run_mode", None)
-            is not LibTunerRunMode.EXHAUSTIVE_COLLECTION
-        ):
+        if self.uses_default_pruning:
             return _prune_mm_configs(configs, named_args, **kwargs)
 
         m, n = args["M"], args["N"]
@@ -470,7 +461,7 @@ mm_nt_split_tuned = libentry()(
         post_hook=_bench_mm_nt_split_merge,
         use_cuda_graph=True,
         rep=20,
-        policy=AscendBlasTuner,
+        policy="flagtune",
         flagtune_op_name="mm",
         flagtune_op_id="flaggems/mm",
         flagtune_variant="nt_split",
@@ -949,7 +940,7 @@ def launch_panel_gemm(kernel, tuner, operands, shape, bm, bk):
     bn = 256
     panels = triton.cdiv(n, bn)
     options = dict(multibuffer=True, unit_flag=True, sync_solver=False)
-    if triton.cdiv(m, bm) * panels <= 65535 and tune_fixed_gemm(tuner):
+    if triton.cdiv(m, bm) * panels <= 65535 and LibTuner.should_tune(tuner):
 
         def grid(meta):
             return (min(triton.cdiv(m, meta["BM"]) * panels, 65535),)
@@ -969,7 +960,7 @@ def _make_mm_fixed_tuner(kernel, variant, key, presets, prune, space):
             key=key,
             prune_configs_by={"early_config_prune": prune},
             use_cuda_graph=True,
-            policy=AscendBlasTuner,
+            policy="flagtune",
             flagtune_op_name="mm",
             flagtune_op_id="flaggems/mm",
             flagtune_variant=variant,
@@ -1042,7 +1033,7 @@ def _launch_mm_packed_narrow(
     m, k = a.shape
     n = out.shape[1]
     options = dict(multibuffer=True, unit_flag=True, sync_solver=False)
-    if triton.cdiv(m, bm) <= 65535 and tune_fixed_gemm(tuner):
+    if triton.cdiv(m, bm) <= 65535 and LibTuner.should_tune(tuner):
         tuner[lambda meta: _mm_capped_grid(triton.cdiv(m, meta["BM"]))](
             a,
             packed,
@@ -1065,7 +1056,7 @@ def _launch_mm_rectangular(a, b, out, bm, bn, bk):
     n = b.shape[1]
     options = dict(multibuffer=True, unit_flag=True, sync_solver=False)
     with torch_device_fn.device(a.device), _blockified():
-        if triton.cdiv(m, bm) * triton.cdiv(n, bn) <= 65535 and tune_fixed_gemm(
+        if triton.cdiv(m, bm) * triton.cdiv(n, bn) <= 65535 and LibTuner.should_tune(
             mm_rectangular_kernel
         ):
 
@@ -1222,7 +1213,7 @@ def _launch_mm_nt(a, b, route):
     c = torch.empty((m, n), device=a.device, dtype=a.dtype)
     with torch_device_fn.device(a.device), _blockified():
         if route == "nt_split":
-            if a.dtype == torch.bfloat16 and tune_fixed_gemm(mm_nt_split_tuned):
+            if a.dtype == torch.bfloat16 and LibTuner.should_tune(mm_nt_split_tuned):
                 partial = torch.empty((8, m, n), device=a.device, dtype=torch.float32)
 
                 def grid(meta):
@@ -1489,7 +1480,9 @@ def mm(a, b):
         return _launch_mm_short_reduction(a, b, c, tiny=route == "tiny_reduction")
     if route == "narrow_gemv":
         with torch_device_fn.device(device):
-            if triton.cdiv(M, 4) <= 65535 and tune_fixed_gemm(mm_narrow_gemv_kernel):
+            if triton.cdiv(M, 4) <= 65535 and LibTuner.should_tune(
+                mm_narrow_gemv_kernel
+            ):
                 mm_narrow_gemv_kernel[
                     lambda meta: _mm_capped_grid(triton.cdiv(M, meta["BLOCK_OUT"]))
                 ](a, b, c, M, N, K)

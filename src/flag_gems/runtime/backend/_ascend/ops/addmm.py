@@ -26,7 +26,6 @@ from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
 from flag_gems.utils import broadcastable_to, libentry, libtuner
 
 from .bmm import (
-    AscendBlasTuner,
     ResourcePrunedGemmTuner,
     _blockified,
     _launch_narrow_gemv,
@@ -575,7 +574,7 @@ _addmm_row_vector_default = libentry()(
         prune_configs_by={"early_config_prune": _prune_addmm_row_vector},
         use_cuda_graph=True,
         rep=20,
-        policy=AscendBlasTuner,
+        policy="flagtune",
         disable_aabs=True,
     )(_addmm_row_vector)
 )
@@ -621,7 +620,7 @@ addmm_wide_panel_kernel = libentry()(
         key=["M", "N", "K"],
         prune_configs_by={"early_config_prune": prune_panel_gemm},
         use_cuda_graph=True,
-        policy=AscendBlasTuner,
+        policy="flagtune",
         flagtune_op_name="addmm",
         flagtune_op_id="flaggems/addmm",
         flagtune_variant="wide_panels",

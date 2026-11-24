@@ -111,13 +111,13 @@ def test_scalar_pruning_only_removes_program_limit_violations():
     assert mul._prune_mul_flat_configs(configs, {"n_elements": 8388608}) == configs[1:]
 
 
-def _track_graph_bench(monkeypatch, mul, tuner):
+def _track_graph_bench(monkeypatch, tuner):
     libentry = importlib.import_module("flag_gems.utils.libentry")
     monkeypatch.setattr(libentry.ConfigCache, "__contains__", lambda self, key: False)
     monkeypatch.setattr(libentry.BenchmarkCache, "get", lambda self, config: None)
     calls = []
     original = tuner.do_bench
-    assert original.func is mul._bench_ascend_graph
+    assert tuner._benchmark_protocol[0] == "ascend_graph"
 
     def tracked(*args, **kwargs):
         calls.append(1)
@@ -134,7 +134,7 @@ def test_scalar_default_autotunes_without_flagtune(monkeypatch, dtype):
     monkeypatch.delenv("FLAGTUNE_INCLUDE", raising=False)
     mul = importlib.import_module(flag_gems.mul.__module__)
     tuner = mul._mul_persistent_default.fn
-    calls = _track_graph_bench(monkeypatch, mul, tuner)
+    calls = _track_graph_bench(monkeypatch, tuner)
     lhs = torch.randn((8192,), dtype=dtype, device="npu")
     actual = flag_gems.mul(lhs, 0.5)
     torch.npu.synchronize()
@@ -155,7 +155,7 @@ def test_mul_expanded_broadcast_candidates_use_npu_graph(monkeypatch, dtype):
     monkeypatch.delenv("USE_FLAGTUNE", raising=False)
     mul = importlib.import_module(flag_gems.mul.__module__)
     tuner = mul.mul_broadcast_tiled_kernel.fn
-    calls = _track_graph_bench(monkeypatch, mul, tuner)
+    calls = _track_graph_bench(monkeypatch, tuner)
     prune = tuner.early_config_prune
 
     def sample_configs(configs, named_args, **kwargs):

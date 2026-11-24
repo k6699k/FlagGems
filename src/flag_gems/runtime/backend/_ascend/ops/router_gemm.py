@@ -21,8 +21,9 @@ import triton.language as tl
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.flagtune import register_flagtune_op
 from flag_gems.utils import libentry, libtuner
+from flag_gems.utils.libentry import LibTuner
 
-from .bmm import AscendBlasTuner, cube_tile_fits_910b, tune_fixed_gemm
+from .bmm import cube_tile_fits_910b
 
 EXPAND_CONFIG_FILENAME = str(
     Path(__file__).resolve().parent.parent / "router_gemm_ascend_expand.yaml"
@@ -244,7 +245,7 @@ router_cube_tuned = libentry()(
         prune_configs_by={"early_config_prune": _prune_router_cube_configs},
         use_cuda_graph=True,
         disable_aabs=True,
-        policy=AscendBlasTuner,
+        policy="flagtune",
         flagtune_op_name="router_gemm",
         flagtune_op_id="flaggems/router_gemm",
         flagtune_variant="cube",
@@ -289,7 +290,9 @@ def router_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
             else out
         )
         args = (x, weight, partial, m, n, k, *strides)
-        if _can_tune_router_cube(m, n, split) and tune_fixed_gemm(router_cube_tuned):
+        if _can_tune_router_cube(m, n, split) and LibTuner.should_tune(
+            router_cube_tuned
+        ):
 
             def grid(meta):
                 return (triton.cdiv(m, meta["BM"]) * triton.cdiv(n, meta["BN"]), split)

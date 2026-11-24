@@ -417,14 +417,19 @@ class LibTuner(triton.runtime.Autotuner):
             unadapted, preserving its Default/Expanded routes.
         """
         benchmark_retries = DEFAULT_BENCHMARK_RETRIES
+        ascend_graph = False
         if do_bench is None and major_version >= 3 and minor_version >= 2:
             if use_cuda_graph:
                 from triton.testing import do_bench_cudagraph
 
-                def do_bench(kernel_call, quantiles):
-                    from flag_gems.runtime import device
+                ascend_graph = device.vendor_name == "ascend"
 
-                    if device.vendor_name == "mthreads":
+                def do_bench(kernel_call, quantiles):
+                    if ascend_graph:
+                        # TorchNPU provides the CUDA Graph API used by Triton.
+                        importlib.import_module("torch_npu.contrib.transfer_to_npu")
+                        torch_device_fn.current_stream().synchronize()
+                    elif device.vendor_name == "mthreads":
                         next_power_of_2 = triton.next_power_of_2
                         try:
                             importlib.import_module("torchada")
@@ -496,7 +501,14 @@ class LibTuner(triton.runtime.Autotuner):
                 prune_configs_by=prune_configs_by,
                 do_bench=do_bench,
             )
-        if do_bench is not None:
+        if ascend_graph:
+            self.benchmark_protocol = None
+            self._benchmark_protocol = (
+                "ascend_graph",
+                -1,
+                rep if rep is not None else 100,
+            )
+        elif do_bench is not None:
             self.benchmark_protocol = None
             self._benchmark_protocol = ("custom_do_bench", -1, -1)
         else:
@@ -790,6 +802,30 @@ class LibTuner(triton.runtime.Autotuner):
             return strategy
 
         return decorator
+
+    @property
+    def has_forced_selection(self) -> bool:
+        return self._run_mode is not LibTunerRunMode.NORMAL
+
+    @property
+    def uses_default_pruning(self) -> bool:
+        return (
+            self._flagtune_mode is runtime.TuningMode.DEFAULT
+            and self._run_mode is not LibTunerRunMode.EXHAUSTIVE_COLLECTION
+        )
+
+    @staticmethod
+    def should_tune(kernel) -> bool:
+        """Decide whether a kernel with a fixed launch should use its tuner."""
+        tuner = getattr(kernel, "fn", None)
+        return isinstance(tuner, LibTuner) and (
+            tuner.has_forced_selection
+            or runtime.flagtune_enabled(tuner._flagtune_op_name)
+            or runtime.resolve_cost_model_intent(
+                supports_cost_model=_supports_flagtune_cost_model(tuner)
+            )
+            is not runtime.CostModelIntent.DISABLED
+        )
 
     @contextmanager
     def use_run_mode(self, mode: Union[LibTunerRunMode, str]) -> Iterator[None]:

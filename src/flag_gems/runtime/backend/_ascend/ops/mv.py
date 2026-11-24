@@ -24,16 +24,9 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.flagtune import register_flagtune_op
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as ext
-from flag_gems.utils.libentry import LibTunerRunMode
+from flag_gems.utils.libentry import LibTuner
 
-from .bmm import (
-    _FP32_BYTES,
-    _UB_BYTES,
-    AscendBlasTuner,
-    is_ascend_910b,
-    tune_fixed_gemm,
-    vector_tile_fits_910b,
-)
+from .bmm import _FP32_BYTES, _UB_BYTES, is_ascend_910b, vector_tile_fits_910b
 
 logger = logging.getLogger(__name__)
 _MV_EXPAND_PATH = str(Path(__file__).resolve().parent.parent / "mv_ascend_expand.yaml")
@@ -85,7 +78,6 @@ def _prune_mv_configs(configs, named_args, **kwargs):
 @libtuner(
     configs=runtime.get_tuned_config("mv"),
     key=["M", "N", "stride_an", "stride_am", "stride_bm", "stride_cn"],
-    strategy=["align32", "align32", "default", "default", "default", "default"],
     prune_configs_by={"early_config_prune": _prune_mv_configs},
     warmup=5,
     rep=20,
@@ -95,7 +87,7 @@ def _prune_mv_configs(configs, named_args, **kwargs):
     flagtune_yaml_path=_MV_EXPAND_PATH,
     flagtune_op_id="flaggems/mv",
     flagtune_variant="gemv",
-    policy=AscendBlasTuner,
+    policy="flagtune",
 )
 @triton.jit
 def mv_kernel(
@@ -281,7 +273,7 @@ mv_column_kernel = libentry()(
             args["X"].dtype,
             args["A"].dtype,
         ),
-        policy=AscendBlasTuner,
+        policy="flagtune",
     )(_mv_column_tiles)
 )
 
@@ -309,7 +301,7 @@ def _launch_column_mv(inp, vec, out, n, k):
     chunk = _COLUMN_MIN_CHUNK if split else 0
     block_n = _COLUMN_SPLIT_BLOCK_N if split else _COLUMN_DIRECT_BLOCK_N
     splits = triton.cdiv(k, chunk) if split else 1
-    tune = tune_fixed_gemm(mv_column_kernel)
+    tune = LibTuner.should_tune(mv_column_kernel)
     # Reserve a row pitch large enough for every candidate's padded output tile.
     row_alignment = _COLUMN_MAX_BLOCK_N if tune else block_n
     padded_n = triton.cdiv(n, row_alignment) * row_alignment
@@ -366,10 +358,7 @@ def mv(inp, vec):
     if N == 0:
         return out
     with torch_device_fn.device(inp.device):
-        # Offline fixed-config collection still targets the existing GEMV tuner.
-        if mv_kernel.fn._run_mode is LibTunerRunMode.NORMAL and _can_launch_column_mv(
-            inp, vec
-        ):
+        if not mv_kernel.fn.has_forced_selection and _can_launch_column_mv(inp, vec):
             _launch_column_mv(inp, vec, out, N, M)
         else:
             _launch_general_mv(inp, vec, out)

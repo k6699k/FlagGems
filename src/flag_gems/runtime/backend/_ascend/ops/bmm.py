@@ -15,7 +15,6 @@
 import logging
 import os
 from contextlib import contextmanager
-from functools import partial
 from pathlib import Path
 
 import torch
@@ -28,11 +27,7 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as ext
-from flag_gems.utils.libentry import (
-    LibTuner,
-    LibTunerRunMode,
-    _supports_flagtune_cost_model,
-)
+from flag_gems.utils.libentry import LibTuner
 
 logger = logging.getLogger(__name__)
 
@@ -92,33 +87,6 @@ def vector_tile_fits_910b(rows, reduction, element_bytes, stages):
     return matrix_bytes + vector_bytes <= _UB_BYTES
 
 
-def _bench_ascend_graph(kernel_call, quantiles, *, rep):
-    from torch_npu.contrib import transfer_to_npu  # noqa: F401
-
-    torch.npu.current_stream().synchronize()
-    return triton.testing.do_bench_cudagraph(kernel_call, rep=rep, quantiles=quantiles)
-
-
-class AscendBlasTuner(LibTuner.get("flagtune")):
-    def __init__(self, *args, use_cuda_graph=False, do_bench=None, rep=100, **kwargs):
-        if use_cuda_graph and do_bench is None:
-            do_bench = partial(_bench_ascend_graph, rep=100 if rep is None else rep)
-        super().__init__(
-            *args, use_cuda_graph=use_cuda_graph, do_bench=do_bench, rep=rep, **kwargs
-        )
-
-    def get_key(self, args):
-        key = super().get_key(args)
-        if is_ascend_910b():
-            # Rerank old cache entries under the 910B rules. Exact dimensions
-            # matter for padding and launch limits even with a bucketed strategy.
-            key += (
-                "ascend910b_blas_resources_v1",
-                *(args[k] for k in self.keys if k in args),
-            )
-        return key
-
-
 @contextmanager
 def _blockified():
     key = "TRITON_ALL_BLOCKS_PARALLEL"
@@ -131,20 +99,6 @@ def _blockified():
             os.environ.pop(key, None)
         else:
             os.environ[key] = previous
-
-
-def tune_fixed_gemm(tuner):
-    autotuner = getattr(tuner, "fn", None)
-    if not isinstance(autotuner, LibTuner):
-        return False
-    return (
-        autotuner._run_mode is not LibTunerRunMode.NORMAL
-        or runtime.flagtune_enabled(autotuner._flagtune_op_name)
-        or runtime.resolve_cost_model_intent(
-            supports_cost_model=_supports_flagtune_cost_model(autotuner)
-        )
-        is not runtime.CostModelIntent.DISABLED
-    )
 
 
 def gemm_dtype_resolver(op, rhs="B"):
@@ -181,7 +135,7 @@ def _prune_bmm_configs(configs, named_args, **kwargs):
     return pruned
 
 
-class ResourcePrunedGemmTuner(AscendBlasTuner):
+class ResourcePrunedGemmTuner(LibTuner.get("flagtune")):
     """Use hardware constraints for search and the existing policy for Default."""
 
     tile_prefix = "TILE"
@@ -195,11 +149,7 @@ class ResourcePrunedGemmTuner(AscendBlasTuner):
         args = {**named_args, **kwargs}
         is_910b = is_ascend_910b()
         names = tuple(f"{self.tile_prefix}_{axis}" for axis in ("M", "N", "K"))
-        if (
-            self._flagtune_mode is runtime.TuningMode.DEFAULT
-            and getattr(self, "_run_mode", None)
-            is not LibTunerRunMode.EXHAUSTIVE_COLLECTION
-        ):
+        if self.uses_default_pruning:
             preferred = self.default_prune(configs, named_args, **kwargs)
             if not is_910b:
                 return preferred
@@ -652,7 +602,7 @@ def _prune_direct_nt_configs(configs, named_args, **kwargs):
     ]
 
 
-class _TiledGemmTuner(AscendBlasTuner):
+class _TiledGemmTuner(LibTuner.get("flagtune")):
     def get_key(self, args):
         key = super().get_key(args)
         if not args["TRANSPOSED"]:
@@ -791,7 +741,7 @@ def _make_split_gemm_tuner(*, op_name=None, yaml_path=None):
             post_hook=_bench_split_merge,
             use_cuda_graph=True,
             rep=20,
-            policy=AscendBlasTuner,
+            policy="flagtune",
             flagtune_op_name=op_name,
             flagtune_op_id=f"flaggems/{op_name}" if op_name else None,
             flagtune_variant="split_k" if op_name else None,
@@ -824,7 +774,7 @@ def _launch_tiled_gemm(a, b, out, tile, bias=None, *, tuner=None, split_tuner=No
         else out
     )
     grid = (triton.cdiv(m, bm) * triton.cdiv(n, bn) * split, batch)
-    tune = split == 1 and tuner is not None and tune_fixed_gemm(tuner)
+    tune = split == 1 and tuner is not None and LibTuner.should_tune(tuner)
     with torch_device_fn.device(a.device):
         with _blockified():
             launch_args = (
@@ -1010,7 +960,7 @@ def _make_gemv_tuner(kernel, op_name, variant, prune, *, yaml_path):
             key=key,
             prune_configs_by={"early_config_prune": prune},
             use_cuda_graph=True,
-            policy=AscendBlasTuner,
+            policy="flagtune",
             flagtune_op_name=op_name,
             flagtune_op_id=f"flaggems/{op_name}",
             flagtune_variant=variant,
@@ -1037,7 +987,7 @@ def _launch_column_gemv(a, b, out, bias=None, *, tuner):
     tiles = triton.cdiv(m, bm)
     args = (a, b, a if bias is None else bias, out, m, k, bias is not None)
     with torch_device_fn.device(a.device):
-        if tune_fixed_gemm(tuner):
+        if LibTuner.should_tune(tuner):
             tuner[lambda meta: (batch * triton.cdiv(m, meta["BM"]),)](
                 *args, BATCH=batch
             )
@@ -1115,7 +1065,7 @@ def _launch_narrow_gemv(a, b, out, bias=None, *, tuner):
     batch = a.shape[0] if a.ndim == 3 else 1
     args = (a, b, a if bias is None else bias, out, m, k, bias is not None)
     with torch_device_fn.device(a.device):
-        if tune_fixed_gemm(tuner):
+        if LibTuner.should_tune(tuner):
             tuner[lambda meta: (m // meta["BM"], batch)](
                 *args, BATCH=batch, a_batch_stride=a.stride(0) if a.ndim == 3 else 0
             )
@@ -1228,7 +1178,7 @@ _packed_gemm_default = libentry()(
         post_hook=_bench_packed_gemm,
         use_cuda_graph=True,
         rep=20,
-        policy=AscendBlasTuner,
+        policy="flagtune",
         disable_aabs=True,
     )(_pack_gemm_rhs)
 )

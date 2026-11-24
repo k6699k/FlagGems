@@ -14,7 +14,7 @@
 
 import logging
 import math
-from functools import lru_cache, partial
+from functools import lru_cache
 from numbers import Number
 from pathlib import Path
 
@@ -28,8 +28,6 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils.libentry import LibTuner
 from flag_gems.utils.shape_utils import volume
-
-from .bmm import AscendBlasTuner, _bench_ascend_graph
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +94,7 @@ _mul_persistent_default = libentry()(
         prune_configs_by={"early_config_prune": _prune_persistent_mul},
         use_cuda_graph=True,
         rep=20,
-        policy=AscendBlasTuner,
+        policy="flagtune",
         disable_aabs=True,
     )(
         triton.heuristics(
@@ -326,7 +324,7 @@ def mul_contiguous_chunked_kernel(
     strategy=["align32", "default"],
     warmup=5,
     rep=5,
-    do_bench=partial(_bench_ascend_graph, rep=5),
+    use_cuda_graph=True,
     flagtune_op_name="mul",
     flagtune_expand_op_name="mul",
     flagtune_yaml_path=_MUL_EXPAND_PATH,
@@ -897,7 +895,7 @@ class _MulTiledTuner(LibTuner.get("flagtune")):
     warmup=5,
     rep=5,
     policy=_MulTiledTuner,
-    do_bench=partial(_bench_ascend_graph, rep=5),
+    use_cuda_graph=True,
     flagtune_op_name="mul",
     flagtune_expand_op_name="mul_broadcast_tiled",
     flagtune_yaml_path=_MUL_EXPAND_PATH,
@@ -998,7 +996,7 @@ _mul_narrow_outer_default = libentry()(
         prune_configs_by={"early_config_prune": _prune_mul_narrow_outer},
         use_cuda_graph=True,
         rep=20,
-        policy=AscendBlasTuner,
+        policy="flagtune",
         disable_aabs=True,
     )(mul_narrow_broadcast_kernel.jit_function)
 )
