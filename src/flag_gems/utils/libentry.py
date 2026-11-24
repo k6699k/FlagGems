@@ -803,24 +803,12 @@ class LibTuner(triton.runtime.Autotuner):
 
         return decorator
 
-    @property
-    def has_forced_selection(self) -> bool:
-        return self._run_mode is not LibTunerRunMode.NORMAL
-
-    @property
-    def uses_default_pruning(self) -> bool:
-        return (
-            self._flagtune_mode is runtime.TuningMode.DEFAULT
-            and self._run_mode is not LibTunerRunMode.EXHAUSTIVE_COLLECTION
-        )
-
     @staticmethod
     def should_tune(kernel) -> bool:
         """Decide whether a kernel with a fixed launch should use its tuner."""
         tuner = getattr(kernel, "fn", None)
         return isinstance(tuner, LibTuner) and (
-            tuner.has_forced_selection
-            or runtime.flagtune_enabled(tuner._flagtune_op_name)
+            runtime.flagtune_enabled(tuner._flagtune_op_name)
             or runtime.resolve_cost_model_intent(
                 supports_cost_model=_supports_flagtune_cost_model(tuner)
             )

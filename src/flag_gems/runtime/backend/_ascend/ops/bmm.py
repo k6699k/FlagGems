@@ -149,7 +149,7 @@ class ResourcePrunedGemmTuner(LibTuner.get("flagtune")):
         args = {**named_args, **kwargs}
         is_910b = is_ascend_910b()
         names = tuple(f"{self.tile_prefix}_{axis}" for axis in ("M", "N", "K"))
-        if self.uses_default_pruning:
+        if self._flagtune_mode is runtime.TuningMode.DEFAULT:
             preferred = self.default_prune(configs, named_args, **kwargs)
             if not is_910b:
                 return preferred
@@ -602,27 +602,6 @@ def _prune_direct_nt_configs(configs, named_args, **kwargs):
     ]
 
 
-class _TiledGemmTuner(LibTuner.get("flagtune")):
-    def get_key(self, args):
-        key = super().get_key(args)
-        if not args["TRANSPOSED"]:
-            return key
-        dtype = args["A"].dtype
-        # Cached winners from the old search space can bypass pruning.
-        if dtype == torch.float16 and args["N"] % 512:
-            if is_ascend_910b() or is_ascend_910c():
-                return (*key, "ascend_nt_fp16_tail_v1")
-        if dtype == torch.bfloat16:
-            if is_ascend_910b():
-                if args["N"] % 512:
-                    return (*key, "ascend910b_nt_column_tail_v1")
-                if args["WITH_BIAS"]:
-                    return (*key, "ascend910b_nt_bias_tail_v1")
-            elif args["WITH_BIAS"] and args["N"] % 256 and is_ascend_910c():
-                return (*key, "ascend910c_nt_bias_tail_v1")
-        return key
-
-
 # Default covers both the small NT tiles and the wider NN launch presets.
 _TILED_GEMM_DEFAULT_TILES = (
     (16, 16, 128),
@@ -668,7 +647,7 @@ def _make_tiled_gemm_tuner(op_name, variant, prune, *, yaml_path):
             key=_TILED_KEY,
             prune_configs_by={"early_config_prune": prune},
             use_cuda_graph=True,
-            policy=_TiledGemmTuner,
+            policy="flagtune",
             flagtune_op_name=op_name,
             flagtune_op_id=f"flaggems/{op_name}",
             flagtune_variant=variant,

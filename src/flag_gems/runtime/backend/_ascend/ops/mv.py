@@ -358,7 +358,7 @@ def mv(inp, vec):
     if N == 0:
         return out
     with torch_device_fn.device(inp.device):
-        if not mv_kernel.fn.has_forced_selection and _can_launch_column_mv(inp, vec):
+        if _can_launch_column_mv(inp, vec):
             _launch_column_mv(inp, vec, out, N, M)
         else:
             _launch_general_mv(inp, vec, out)

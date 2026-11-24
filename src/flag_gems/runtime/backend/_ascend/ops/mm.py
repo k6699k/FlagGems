@@ -142,10 +142,10 @@ class _MMFlagTuneTuner(LibTuner.get("flagtune")):
                 args["A"].dtype,
                 ("BLOCK_M", "BLOCK_N", "BLOCK_K"),
             )
-            if self.uses_default_pruning:
+            if self._flagtune_mode is runtime.TuningMode.DEFAULT:
                 return _prune_mm_configs(valid, named_args, **kwargs)
             return valid
-        if self.uses_default_pruning:
+        if self._flagtune_mode is runtime.TuningMode.DEFAULT:
             return _prune_mm_configs(configs, named_args, **kwargs)
 
         m, n = args["M"], args["N"]
