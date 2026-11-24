@@ -21,6 +21,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.cann.extension as extension
+from triton.backends.ascend.compiler import NPUOptions
 
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
@@ -925,15 +926,18 @@ def _make_gemv_tuner(kernel, op_name, variant, prune, *, yaml_path):
     key = ["M", "K", "WITH_BIAS", "BATCH"]
     if variant == "narrow_gemv":
         key.append("a_batch_stride")
-    tiles = (
-        [(8, 512), (8, 1024), (8, 2048), (16, 1024), (32, 512)]
-        if variant == "column_gemv"
-        else [(8, 1024)]
-    )
+        tiles = [(8, 1024)]
+        # Match the compiler defaults used by the original fixed launch.
+        num_warps, num_stages = NPUOptions.num_warps, NPUOptions.num_stages
+    else:
+        tiles = [(8, 512), (8, 1024), (8, 2048), (16, 1024), (32, 512)]
+        num_warps, num_stages = 32, 1
     return libentry()(
         libtuner(
             configs=[
-                triton.Config({"BM": bm, "BK": bk}, num_warps=32, num_stages=1)
+                triton.Config(
+                    {"BM": bm, "BK": bk}, num_warps=num_warps, num_stages=num_stages
+                )
                 for bm, bk in tiles
             ],
             key=key,
@@ -1044,12 +1048,9 @@ def _launch_narrow_gemv(a, b, out, bias=None, *, tuner):
     batch = a.shape[0] if a.ndim == 3 else 1
     args = (a, b, a if bias is None else bias, out, m, k, bias is not None)
     with torch_device_fn.device(a.device):
-        if LibTuner.should_tune(tuner):
-            tuner[lambda meta: (m // meta["BM"], batch)](
-                *args, BATCH=batch, a_batch_stride=a.stride(0) if a.ndim == 3 else 0
-            )
-        else:
-            _narrow_gemv_kernel[(m // 8, batch)](*args, 8, 1024)
+        tuner[lambda meta: (m // meta["BM"], batch)](
+            *args, BATCH=batch, a_batch_stride=a.stride(0) if a.ndim == 3 else 0
+        )
     return out
 
 
