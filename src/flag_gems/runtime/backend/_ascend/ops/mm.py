@@ -559,6 +559,8 @@ def _mm_packed_narrow_kernel(
     K: tl.constexpr,
     BM: tl.constexpr,
     BK: tl.constexpr,
+    rhs_stride_k: tl.constexpr = 0,
+    rhs_stride_n: tl.constexpr = 0,
 ):
     for pid in range(tl.program_id(0), tl.cdiv(M, BM), tl.num_programs(0)):
         rows = pid * BM + tl.arange(0, BM)
@@ -918,10 +920,11 @@ mm_narrow_gemv_kernel = _make_mm_fixed_tuner(
     "mm_narrow_gemv",
     stages=1,
 )
+_PACKED_NARROW_KEY = ["M", "N", "K", "rhs_stride_k", "rhs_stride_n"]
 mm_packed_narrow_kernel = _make_mm_fixed_tuner(
     _mm_packed_narrow_kernel,
     "packed_narrow",
-    ["M", "N", "K"],
+    _PACKED_NARROW_KEY,
     {"BM": 64, "BK": 512},
     _prune_mm_packed_narrow,
     "mm_packed_narrow",
@@ -929,7 +932,7 @@ mm_packed_narrow_kernel = _make_mm_fixed_tuner(
 mm_packed_narrow_nt_kernel = _make_mm_fixed_tuner(
     _mm_packed_narrow_kernel,
     "packed_narrow_nt",
-    ["M", "N", "K"],
+    _PACKED_NARROW_KEY,
     {"BM": 16, "BK": 512},
     _prune_mm_packed_narrow,
     "mm_packed_narrow",
@@ -945,23 +948,25 @@ mm_wide_panel_kernel = _make_mm_fixed_tuner(
     prune_panel_gemm,
     "panel_gemm",
 )
-mm_large_panel_kernel = _make_mm_fixed_tuner(
-    _mm_large_panel_cube_kernel,
-    "large_panels",
-    ["M", "N", "K"],
-    {"BM": 128, "BK": 256},
-    prune_panel_gemm,
-    "panel_gemm",
-)
 
 
-def _launch_mm_packed_narrow(a, packed, out, bm, bk, *, tuner=mm_packed_narrow_kernel):
+def _launch_mm_packed_narrow(
+    a, packed, out, bm, bk, *, rhs_strides, tuner=mm_packed_narrow_kernel
+):
     m, k = a.shape
     n = out.shape[1]
     options = dict(multibuffer=True, unit_flag=True, sync_solver=False)
     if tune_fixed_gemm(tuner):
         tuner[lambda meta: _mm_capped_grid(triton.cdiv(m, meta["BM"]))](
-            a, packed, out, m, n, k, **options
+            a,
+            packed,
+            out,
+            m,
+            n,
+            k,
+            rhs_stride_k=rhs_strides[0],
+            rhs_stride_n=rhs_strides[1],
+            **options,
         )
     else:
         _mm_packed_narrow_kernel[_mm_capped_grid(triton.cdiv(m, bm))](
@@ -992,18 +997,24 @@ def _launch_mm_rectangular(a, b, out, bm, bn, bk):
 def _launch_mm_packed_rhs(a, b, out):
     m, k = a.shape
     n = b.shape[1]
+    # Preserve the layout in the tuning key before packing makes it identical.
+    rhs_strides = b.stride()
+    if not b.is_contiguous():
+        b = b.contiguous()
     packed = torch.empty((n, k), device=a.device, dtype=b.dtype)
     with torch_device_fn.device(a.device), _blockified():
         if n == 16:
             _mm_pack_narrow_b_kernel[_mm_capped_grid(triton.cdiv(k, 512))](
                 b, packed, n, k, 512, 16, multibuffer=False
             )
-            _launch_mm_packed_narrow(a, packed, out, 64 if m >= 4096 else 16, 1024)
+            _launch_mm_packed_narrow(
+                a, packed, out, 64 if m >= 4096 else 16, 1024, rhs_strides=rhs_strides
+            )
         else:
             _mm_pack_narrow4_split_kernel[_mm_capped_grid(k // 512)](
                 b, packed, k, 512, multibuffer=False
             )
-            _launch_mm_packed_narrow(a, packed, out, 16, 512)
+            _launch_mm_packed_narrow(a, packed, out, 16, 512, rhs_strides=rhs_strides)
     return out
 
 
@@ -1015,18 +1026,42 @@ def _launch_mm_panels(a, b, out, *, wide):
         panels = n // bn
         bm, bk = (16 if m <= 16 else 128), 128
         pack = _mm_pack_wide_panels_kernel
-        kernel, tuner = _mm_wide_panel_cube_kernel, mm_wide_panel_kernel
     else:
         panels = triton.cdiv(n, bn)
         bm, bk = 128, 256
         pack = _mm_pack_large_panels_kernel
-        kernel, tuner = _mm_large_panel_cube_kernel, mm_large_panel_kernel
     packed = torch.empty((panels, k, bn), device=a.device, dtype=b.dtype)
     with torch_device_fn.device(a.device), _blockified():
         pack[_mm_capped_grid(panels * (k // 64))](
             b, packed, n, k, bn, 64, multibuffer=False
         )
-        launch_panel_gemm(kernel, tuner, (a, packed, out), (m, n, k), bm, bk)
+        if wide:
+            launch_panel_gemm(
+                _mm_wide_panel_cube_kernel,
+                mm_wide_panel_kernel,
+                (a, packed, out),
+                (m, n, k),
+                bm,
+                bk,
+            )
+        else:
+            grid = _mm_capped_grid(triton.cdiv(m, bm) * panels)
+            _mm_large_panel_cube_kernel[grid](
+                a,
+                packed,
+                out,
+                m,
+                n,
+                k,
+                bm,
+                bn,
+                bk,
+                num_stages=2,
+                num_warps=4,
+                multibuffer=True,
+                unit_flag=True,
+                sync_solver=False,
+            )
     return out
 
 
@@ -1298,15 +1333,22 @@ def mm(a, b):
         c = torch.empty((M, N), device=device, dtype=a.dtype)
         with torch_device_fn.device(device), _blockified():
             _launch_mm_packed_narrow(
-                a, b.T, c, bm, bk, tuner=mm_packed_narrow_nt_kernel
+                a,
+                b.T,
+                c,
+                bm,
+                bk,
+                rhs_strides=b.stride(),
+                tuner=mm_packed_narrow_nt_kernel,
             )
         return c
+    if route in ("packed_narrow16", "packed_narrow4"):
+        c = torch.empty((M, N), device=device, dtype=get_higher_dtype(a.dtype, b.dtype))
+        return _launch_mm_packed_rhs(a, b, c)
     # The remaining kernels require row-major or explicitly packed operands.
     if not b.is_contiguous():
         b = b.contiguous()
     c = torch.empty((M, N), device=device, dtype=get_higher_dtype(a.dtype, b.dtype))
-    if route in ("packed_narrow16", "packed_narrow4"):
-        return _launch_mm_packed_rhs(a, b, c)
     if route in ("wide_panels", "large_panels"):
         return _launch_mm_panels(a, b, c, wide=route == "wide_panels")
     if route == "persistent_smallk":

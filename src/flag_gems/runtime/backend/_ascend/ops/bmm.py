@@ -500,6 +500,7 @@ def _tiled_gemm_kernel(
     BK: tl.constexpr,
     SPLIT: tl.constexpr,
     HINT: tl.constexpr,
+    a_batch_stride: tl.constexpr = 0,
 ):
     pid = tl.program_id(0)
     split = pid % SPLIT
@@ -567,7 +568,16 @@ def _finish_split_gemm(
     tl.store(Out + offset, value, offset < TOTAL)
 
 
-_TILED_KEY = ["BATCH", "M", "N", "K", "TRANSPOSED", "WITH_BIAS", "HINT"]
+_TILED_KEY = [
+    "BATCH",
+    "M",
+    "N",
+    "K",
+    "TRANSPOSED",
+    "WITH_BIAS",
+    "HINT",
+    "a_batch_stride",
+]
 _NT_BIAS_TAIL_MAX_BK_910B = 128
 
 
@@ -739,7 +749,13 @@ def _launch_tiled_gemm(a, b, out, tile, bias=None, *, tuner=None):
                         batch,
                     )
 
-                tuner[tuned_grid](*launch_args, SPLIT=1, HINT=hint, **launch_options)
+                tuner[tuned_grid](
+                    *launch_args,
+                    SPLIT=1,
+                    HINT=hint,
+                    a_batch_stride=a.stride(0) if a.ndim == 3 else 0,
+                    **launch_options,
+                )
             else:
                 if (
                     split == 1
@@ -861,11 +877,13 @@ def _prune_column_gemv(configs, named_args, **kwargs):
 
 
 def _make_gemv_tuner(kernel, op_name, variant, prune, *, yaml_path):
-    # BATCH is launch metadata and keeps distinct batch sizes in the tuning key.
+    key = ["M", "K", "WITH_BIAS", "BATCH"]
+    if variant == "narrow_gemv":
+        key.append("a_batch_stride")
     return libentry()(
         libtuner(
             configs=[triton.Config({"BM": 8, "BK": 1024}, num_warps=4, num_stages=1)],
-            key=["M", "K", "WITH_BIAS", "BATCH"],
+            key=key,
             prune_configs_by={"early_config_prune": prune},
             use_cuda_graph=True,
             policy=AscendBlasTuner,
@@ -916,6 +934,7 @@ def _narrow_gemv_kernel(
     BM: tl.constexpr,
     BK: tl.constexpr,
     BATCH: tl.constexpr = 1,
+    a_batch_stride: tl.constexpr = 0,
 ):
     rows = tl.program_id(0) * BM + tl.arange(0, BM)
     batch = tl.program_id(1)
@@ -973,7 +992,9 @@ def _launch_narrow_gemv(a, b, out, bias=None, *, tuner):
     args = (a, b, a if bias is None else bias, out, m, k, bias is not None)
     with torch_device_fn.device(a.device):
         if tune_fixed_gemm(tuner):
-            tuner[lambda meta: (m // meta["BM"], batch)](*args, BATCH=batch)
+            tuner[lambda meta: (m // meta["BM"], batch)](
+                *args, BATCH=batch, a_batch_stride=a.stride(0) if a.ndim == 3 else 0
+            )
         else:
             _narrow_gemv_kernel[(m // 8, batch)](*args, 8, 1024)
     return out

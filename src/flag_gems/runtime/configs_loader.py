@@ -1087,12 +1087,13 @@ class TunedConfigLoader(object):
             "addmm_vector": self._build_single_expand_spec("addmm_vector"),
             "baddbmm_gemm": self._build_single_expand_spec("baddbmm_gemm"),
             "baddbmm_vector": self._build_single_expand_spec("baddbmm_vector"),
-            **{
-                name: {
-                    "key": ["M", "K", "WITH_BIAS", "BATCH"],
-                    "default_strategy": ["default"] * 4,
-                }
-                for name in ("narrow_gemv_ascend", "column_gemv_ascend")
+            "narrow_gemv_ascend": {
+                "key": ["M", "K", "WITH_BIAS", "BATCH", "a_batch_stride"],
+                "default_strategy": ["default"] * 5,
+            },
+            "column_gemv_ascend": {
+                "key": ["M", "K", "WITH_BIAS", "BATCH"],
+                "default_strategy": ["default"] * 4,
             },
             "mm_narrow_gemv_ascend": {
                 "key": ["M", "K"],
@@ -1100,16 +1101,25 @@ class TunedConfigLoader(object):
             },
             **{
                 name: {"key": ["M", "N", "K"], "default_strategy": ["default"] * 3}
-                for name in (
-                    "mm_rectangular_ascend",
-                    "mm_packed_narrow_ascend",
-                    "panel_gemm_ascend",
-                )
+                for name in ("mm_rectangular_ascend", "panel_gemm_ascend")
+            },
+            "mm_packed_narrow_ascend": {
+                "key": ["M", "N", "K", "rhs_stride_k", "rhs_stride_n"],
+                "default_strategy": ["default"] * 5,
             },
             "tiled_gemm_ascend": {
                 "yaml_op_name": "tiled_gemm_ascend",
-                "key": ["BATCH", "M", "N", "K", "TRANSPOSED", "WITH_BIAS", "HINT"],
-                "default_strategy": ["default"] * 7,
+                "key": [
+                    "BATCH",
+                    "M",
+                    "N",
+                    "K",
+                    "TRANSPOSED",
+                    "WITH_BIAS",
+                    "HINT",
+                    "a_batch_stride",
+                ],
+                "default_strategy": ["default"] * 8,
             },
             "router_gemm_ascend": {
                 "key": ["M", "N", "K", "XM", "XK", "WN", "WK", "SPLIT"],
