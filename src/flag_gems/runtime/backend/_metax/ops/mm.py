@@ -325,8 +325,10 @@ def _keep_all(configs, _named_args, **_kwargs):
     prune_configs_by={"early_config_prune": _prune_gemm},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_gemm",
+    policy="flagtune",
     flagtune_op_id="flaggems/mm",
     flagtune_variant="metax_gemm",
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=20,
 )
@@ -448,8 +450,10 @@ def mm_kernel(
     prune_configs_by={"early_config_prune": _prune_nt_rows},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_nt_rows",
+    policy="flagtune",
     flagtune_op_id="flaggems/mm",
     flagtune_variant="metax_nt_rows",
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=20,
 )
@@ -564,8 +568,10 @@ def mm_kernel_nt_rows(
     prune_configs_by={"early_config_prune": _prune_wide},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_wide",
+    policy="flagtune",
     flagtune_op_id="flaggems/mm",
     flagtune_variant="metax_wide",
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=20,
 )
@@ -686,8 +692,10 @@ def mm_kernel_wide(
     prune_configs_by={"early_config_prune": _prune_dense},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_dense",
+    policy="flagtune",
     flagtune_op_id="flaggems/mm",
     flagtune_variant="metax_dense",
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=20,
 )
@@ -746,6 +754,7 @@ def mm_kernel_nn(
     prune_configs_by={"early_config_prune": _prune_syrk},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_syrk",
+    policy="flagtune",
     flagtune_op_id="flaggems/mm",
     flagtune_variant="metax_syrk",
     flagtune_dtype_resolver=lambda args: (
@@ -753,6 +762,7 @@ def mm_kernel_nn(
         args["A"].dtype,
         args["C"].dtype,
     ),
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=20,
 )
@@ -809,8 +819,10 @@ def _syrk_kernel(
     prune_configs_by={"early_config_prune": _prune_simt_row},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_simt_row",
+    policy="flagtune",
     flagtune_op_id="flaggems/mm",
     flagtune_variant="metax_simt_row",
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=20,
 )
@@ -863,8 +875,10 @@ def _simt_row_kernel(
     prune_configs_by={"early_config_prune": _prune_simt_column},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_simt_column",
+    policy="flagtune",
     flagtune_op_id="flaggems/mm",
     flagtune_variant="metax_simt_column",
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=20,
 )
@@ -917,6 +931,7 @@ def mm_kernel_small_n_partial(
     prune_configs_by={"early_config_prune": _keep_all},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_pack",
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=20,
 )
@@ -946,6 +961,7 @@ def _pack_rhs_kernel(
     prune_configs_by={"early_config_prune": _keep_all},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_reduce",
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=20,
 )
@@ -1075,8 +1091,10 @@ def _partial_tuner(kernel):
             prune_configs_by={"early_config_prune": tuner.early_config_prune},
             flagtune_op_name="mm",
             flagtune_expand_op_name=tuner._flagtune_expand_op_name,
+            policy="flagtune",
             flagtune_op_id="flaggems/mm",
             flagtune_variant=tuner._flagtune_variant + "_partial",
+            use_cuda_graph=True,
             flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
             rep=20,
         )(kernel.jit_function)
@@ -1256,6 +1274,50 @@ def _dispatch_mm(
     return mm_kernel, split, pack
 
 
+def _launch_mm_gemm(a, b, out, tuned, split_k):
+    m, k = a.shape
+    n = b.shape[1]
+    a_strides, b_strides, c_strides = a.stride(), b.stride(), out.stride()
+    target = out
+    target_strides = c_strides
+    if split_k > 1:
+        target = torch.empty((split_k, m, n), device=a.device, dtype=torch.float32)
+        target_strides = (n, 1)
+
+    if tuned is _simt_row_kernel:
+        grid = lambda cfg: (split_k * m * triton.cdiv(n, cfg["BN"]),)
+    elif tuned is mm_kernel_small_n_partial:
+        grid = lambda cfg: (split_k * n * triton.cdiv(m, cfg["BM"]),)
+    else:
+
+        def grid(cfg):
+            rows, columns = (n, m) if cfg["TRANSPOSE"] else (m, n)
+            return (
+                split_k
+                * triton.cdiv(rows, cfg["BM"])
+                * triton.cdiv(columns, cfg["BN"]),
+            )
+
+    if split_k > 1:
+        tuned = _PARTIAL_KERNELS[tuned]
+    tuned[grid](
+        a,
+        b,
+        target,
+        m,
+        n,
+        k,
+        *a_strides,
+        *b_strides,
+        *target_strides,
+        SPLIT_K=split_k,
+    )
+    if split_k > 1:
+        mm_kernel_splitk_reduce[lambda cfg: (triton.cdiv(m * n, cfg["BLOCK"]),)](
+            target, out, n, m * n, *c_strides, SPLIT_K=split_k
+        )
+
+
 def mm(a, b, *, out=None):
     logger.debug("GEMS METAX MM")
     assert a.shape[1] == b.shape[0], "incompatible dimensions"
@@ -1315,44 +1377,7 @@ def mm(a, b, *, out=None):
             tuned[grid](a, out, m, k, *a_strides, *c_strides)
             return out
 
-        target = out
-        target_strides = c_strides
-        if split_k > 1:
-            target = torch.empty((split_k, m, n), device=a.device, dtype=torch.float32)
-            target_strides = (n, 1)
-
-        if tuned is _simt_row_kernel:
-            grid = lambda cfg: (split_k * m * triton.cdiv(n, cfg["BN"]),)
-        elif tuned is mm_kernel_small_n_partial:
-            grid = lambda cfg: (split_k * n * triton.cdiv(m, cfg["BM"]),)
-        else:
-
-            def grid(cfg):
-                rows, columns = (n, m) if cfg["TRANSPOSE"] else (m, n)
-                return (
-                    split_k
-                    * triton.cdiv(rows, cfg["BM"])
-                    * triton.cdiv(columns, cfg["BN"]),
-                )
-
-        if split_k > 1:
-            tuned = _PARTIAL_KERNELS[tuned]
-        tuned[grid](
-            a,
-            b,
-            target,
-            m,
-            n,
-            k,
-            *a_strides,
-            *b_strides,
-            *target_strides,
-            SPLIT_K=split_k,
-        )
-        if split_k > 1:
-            mm_kernel_splitk_reduce[lambda cfg: (triton.cdiv(m * n, cfg["BLOCK"]),)](
-                target, out, n, m * n, *c_strides, SPLIT_K=split_k
-            )
+        _launch_mm_gemm(a, b, out, tuned, split_k)
     return out
 
 

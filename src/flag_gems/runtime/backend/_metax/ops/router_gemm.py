@@ -146,10 +146,15 @@ _NT128_SHARED_BYTES = 64 * 1024
 def _router_bench_post_hook(args, exception):
     # Autotuning must include the reduction in each split-K candidate's timing.
     if exception is None and args["SPLIT_K"] > 1:
-        size = args["M"] * args["N"]
-        _router_reduce_kernel[(triton.cdiv(size, 256),)](
-            args["P"], args["Y"], size, args["SPLIT_K"], 256, num_warps=4
+        _launch_router_reduce(
+            args["P"], args["Y"], args["M"] * args["N"], args["SPLIT_K"]
         )
+
+
+def _launch_router_reduce(partial, out, size, split_k):
+    _router_reduce_kernel[(triton.cdiv(size, 256),)](
+        partial, out, size, split_k, 256, num_warps=4
+    )
 
 
 def _prune_router(configs, named_args, **kwargs):
@@ -224,6 +229,15 @@ def _prune_router(configs, named_args, **kwargs):
     post_hook=_router_bench_post_hook,
     flagtune_op_name="router_gemm",
     flagtune_expand_op_name="router_gemm",
+    flagtune_op_id="flaggems/router_gemm",
+    flagtune_variant="gemm",
+    policy="flagtune",
+    flagtune_dtype_resolver=lambda args: (
+        args["X"].dtype,
+        args["W"].dtype,
+        args["Y"].dtype,
+    ),
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=30,
 )
@@ -306,7 +320,5 @@ def router_gemm(input, weight):
         if meta["SPLIT_K"] > 1:
             # The next launch waits for all partials, then sums them in a fixed
             # order without atomic updates to the output.
-            _router_reduce_kernel[(triton.cdiv(m * n, 256),)](
-                partial, out, m * n, meta["SPLIT_K"], 256, num_warps=4
-            )
+            _launch_router_reduce(partial, out, m * n, meta["SPLIT_K"])
     return out

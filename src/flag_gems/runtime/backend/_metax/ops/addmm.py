@@ -69,12 +69,44 @@ def _affine_finish_kernel(
     tl.store(C + batch * SCB + m * SCM + n * SCN, acc, i < M * N)
 
 
+def _launch_affine_finish(
+    partial,
+    out,
+    bias,
+    alpha,
+    beta,
+    m,
+    n,
+    batch,
+    out_strides,
+    bias_strides,
+    split_k,
+    flags,
+    *,
+    zero=False,
+):
+    _affine_finish_kernel[(triton.cdiv(m * n, 256), batch)](
+        partial,
+        out,
+        bias,
+        alpha,
+        beta,
+        m,
+        n,
+        *out_strides,
+        *bias_strides,
+        split_k,
+        *flags,
+        zero,
+        BLOCK=256,
+        num_warps=4,
+    )
+
+
 def _affine_bench_post_hook(args, exception):
     # Include the selected split-K reduction in candidate timing.
     if exception is None and args["SPLIT_K"] > 1:
-        _affine_finish_kernel[
-            (triton.cdiv(args["M"] * args["N"], 256), args.get("BATCH", 1))
-        ](
+        _launch_affine_finish(
             args["P"],
             args["C"],
             args["Bias"],
@@ -82,23 +114,15 @@ def _affine_bench_post_hook(args, exception):
             args["beta"],
             args["M"],
             args["N"],
-            args.get("SCB", 0),
-            args["SCM"],
-            args["SCN"],
-            args.get("SIB", 0),
-            args["SIM"],
-            args["SIN"],
+            args.get("BATCH", 1),
+            (args.get("SCB", 0), args["SCM"], args["SCN"]),
+            (args.get("SIB", 0), args["SIM"], args["SIN"]),
             args["SPLIT_K"],
-            args["BETA_ZERO"],
-            args["ALPHA_ONE"],
-            args["BETA_ONE"],
-            False,
-            BLOCK=256,
-            num_warps=4,
+            (args["BETA_ZERO"], args["ALPHA_ONE"], args["BETA_ONE"]),
         )
 
 
-class _AffineTuner(LibTuner.get("default")):
+class _AffineTuner(LibTuner.get("flagtune")):
     """Time GEMM and its selected split-K finish as one candidate."""
 
     def _bench(self, *args, config, **meta):
@@ -374,6 +398,25 @@ def _affine_vector(
     tl.store(C + split.to(tl.int64) * M * N + m * SCM + n * SCN, result, n < N)
 
 
+def _affine_vector_plan(a, b):
+    m, k = a.shape[-2:]
+    n = b.shape[-1]
+    small_strided = (
+        max(m, n) <= 32
+        and k <= 256
+        and (1 not in a.stride()[-2:] or 1 not in b.stride()[-2:])
+    )
+    transpose = not small_strided and (n == 1 or (n <= 8 and m > n))
+    rows, cols = (n, m) if transpose else (m, n)
+    vector = small_strided or rows == 1 or (rows <= 8 and cols <= 32)
+    return small_strided, transpose, vector
+
+
+def _affine_model_dtypes(args):
+    # Public addmm/baddbmm input order, followed by output. P is scratch.
+    return tuple(args[name].dtype for name in ("Bias", "A", "B", "C"))
+
+
 def _affine_matmul(
     bias, a, b, beta, alpha, out, shape, k, si, gemm_kernel, vector_kernel
 ):
@@ -388,9 +431,11 @@ def _affine_matmul(
     )
     if not batch or not m or not n:
         return out
+    out_strides = (out_batch_stride, *out.stride()[-2:])
+    flags = (beta == 0, alpha == 1, beta == 1)
     with torch_device_fn.device(a.device):
         if not k or alpha == 0:
-            _affine_finish_kernel[(triton.cdiv(m * n, 256), batch)](
+            _launch_affine_finish(
                 out,
                 out,
                 bias,
@@ -398,27 +443,17 @@ def _affine_matmul(
                 beta,
                 m,
                 n,
-                out_batch_stride,
-                *out.stride()[-2:],
-                *si,
+                batch,
+                out_strides,
+                si,
                 1,
-                beta == 0,
-                alpha == 1,
-                beta == 1,
-                True,
-                BLOCK=256,
-                num_warps=4,
+                flags,
+                zero=True,
             )
             return out
 
-        small_strided = (
-            max(m, n) <= 32
-            and k <= 256
-            and (1 not in a.stride()[-2:] or 1 not in b.stride()[-2:])
-        )
-        transpose = not small_strided and (n == 1 or (n <= 8 and m > n))
+        small_strided, transpose, vector = _affine_vector_plan(a, b)
         rows, cols = (n, m) if transpose else (m, n)
-        vector = small_strided or rows == 1 or (rows <= 8 and cols <= 32)
         # Split-K partials are FP32 even when the final output is half precision.
         bytes_per_split = batch * m * n * torch.float32.itemsize
         split_limit = min(
@@ -446,16 +481,14 @@ def _affine_matmul(
             beta,
             *batch_args,
             *si[-2:],
-            beta == 0,
-            alpha == 1,
-            beta == 1,
+            *flags,
             max_split,
             m,
             n,
             k,
             *a.stride()[-2:],
             *b.stride()[-2:],
-            *out.stride()[-2:],
+            *out_strides[-2:],
             a.data_ptr() % 16,
             b.data_ptr() % 16,
             out.data_ptr() % 16,
@@ -481,7 +514,7 @@ def _affine_matmul(
             _, meta = gemm_kernel[grid](*args)
         if meta["SPLIT_K"] > 1:
             # All FP32 partials are ready before the reduction and affine epilogue.
-            _affine_finish_kernel[(triton.cdiv(m * n, 256), batch)](
+            _launch_affine_finish(
                 partial,
                 out,
                 bias,
@@ -489,16 +522,11 @@ def _affine_matmul(
                 beta,
                 m,
                 n,
-                out_batch_stride,
-                *out.stride()[-2:],
-                *si,
+                batch,
+                out_strides,
+                si,
                 meta["SPLIT_K"],
-                beta == 0,
-                alpha == 1,
-                beta == 1,
-                False,
-                BLOCK=256,
-                num_warps=4,
+                flags,
             )
     return out
 
@@ -663,6 +691,10 @@ def _prune_addmm_gemm(configs, named_args, **kwargs):
     post_hook=_affine_bench_post_hook,
     flagtune_op_name="addmm",
     flagtune_expand_op_name="addmm_gemm",
+    flagtune_op_id="flaggems/addmm",
+    flagtune_variant="gemm",
+    flagtune_dtype_resolver=_affine_model_dtypes,
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=30,
 )
@@ -745,6 +777,10 @@ def _addmm_gemm_kernel(
     post_hook=_affine_bench_post_hook,
     flagtune_op_name="addmm",
     flagtune_expand_op_name="addmm_vector",
+    flagtune_op_id="flaggems/addmm",
+    flagtune_variant="vector",
+    flagtune_dtype_resolver=_affine_model_dtypes,
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=30,
 )

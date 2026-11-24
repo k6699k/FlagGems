@@ -101,7 +101,7 @@ def _prune_bmm(configs, named_args, **kwargs):
     return result
 
 
-class _BmmMmaTuner(LibTuner.get("default")):
+class _BmmMmaTuner(LibTuner.get("flagtune")):
     """Preserve short-K tiles and pruning against the logical transposed axes."""
 
     def _make_config_table_name(self):
@@ -163,6 +163,9 @@ def _prune_wide(configs, named_args, **kwargs):
     policy=_BmmMmaTuner,
     flagtune_op_name="bmm",
     flagtune_expand_op_name="bmm_gemm",
+    flagtune_op_id="flaggems/bmm",
+    flagtune_variant="gemm",
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=20,
 )
@@ -295,6 +298,9 @@ def _bmm_kernel(
     policy=_BmmMmaTuner,
     flagtune_op_name="bmm",
     flagtune_expand_op_name="bmm_wide",
+    flagtune_op_id="flaggems/bmm",
+    flagtune_variant="wide",
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=20,
 )
@@ -630,31 +636,8 @@ def _prune_vector(configs, named_args, **kwargs):
 
 # BATCH is a tuning key: it changes the launch size even though each
 # vector program gets its batch index directly from the grid.
-@libentry()
-@libtuner(
-    configs=runtime.ops_get_configs("bmm_vector", yaml_path=EXPAND_CONFIG_FILENAME),
-    key=[
-        "R",
-        "K",
-        "BATCH",
-        "SAB",
-        "SAR",
-        "SAK",
-        "SXB",
-        "SXK",
-        "SYB",
-        "SYR",
-        "SPLIT_K",
-        "COLUMN",
-    ],
-    prune_configs_by={"early_config_prune": _prune_vector},
-    flagtune_op_name="bmm",
-    flagtune_expand_op_name="bmm_vector",
-    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
-    rep=20,
-)
 @triton.jit
-def _bmm_vector_kernel(
+def _bmm_vector_impl(
     A,
     X,
     Y,
@@ -702,6 +685,43 @@ def _bmm_vector_kernel(
     tl.store(Y + batch * SYB + part.to(tl.int64) * R + r * SYR, value, r < R)
 
 
+def _vector_entry(variant):
+    return libentry()(
+        libtuner(
+            configs=runtime.ops_get_configs(
+                "bmm_vector", yaml_path=EXPAND_CONFIG_FILENAME
+            ),
+            key=[
+                "R",
+                "K",
+                "BATCH",
+                "SAB",
+                "SAR",
+                "SAK",
+                "SXB",
+                "SXK",
+                "SYB",
+                "SYR",
+                "SPLIT_K",
+                "COLUMN",
+            ],
+            prune_configs_by={"early_config_prune": _prune_vector},
+            flagtune_op_name="bmm",
+            flagtune_expand_op_name="bmm_vector",
+            flagtune_op_id="flaggems/bmm",
+            flagtune_variant=variant,
+            policy="flagtune",
+            use_cuda_graph=True,
+            flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+            rep=20,
+        )(_bmm_vector_impl)
+    )
+
+
+_bmm_vector_kernel = _vector_entry("vector")
+_bmm_vector_partial = _vector_entry("vector_partial")
+
+
 def _bmm_vector(a, b, out, split, transpose, column):
     batch, m, k = a.shape
     n = b.shape[2]
@@ -724,7 +744,8 @@ def _bmm_vector(a, b, out, split, transpose, column):
         target = torch.empty((batch, split, rows), device=a.device, dtype=torch.float32)
         syb = split * rows
         target_syr = 1
-    _bmm_vector_kernel[lambda meta: (triton.cdiv(rows, meta["BR"]), split, batch)](
+    kernel = _bmm_vector_partial if split > 1 else _bmm_vector_kernel
+    kernel[lambda meta: (triton.cdiv(rows, meta["BR"]), split, batch)](
         matrix,
         vector,
         target,
@@ -747,6 +768,130 @@ def _bmm_vector(a, b, out, split, transpose, column):
         )
 
 
+def _select_bmm_route(a, b, out=None):
+    """Choose the launch from metadata; public pretune allocates contiguous output."""
+    batch, m, k = a.shape
+    n = b.shape[2]
+    if not batch or not m or not n or not k:
+        return "empty", 1, False
+    a_strides, b_strides = a.stride(), b.stride()
+    half = a.dtype in (torch.float16, torch.bfloat16)
+    out_dtype = a.dtype if out is None else out.dtype
+    contiguous_out = out is None or out.is_contiguous()
+    if (
+        a.dtype == torch.float32
+        and torch.backends.cuda.matmul.allow_tf32
+        and min(m, n) >= 1024
+        and k >= 4096
+        and k % 32 == 0
+        and a_strides[2] == 1
+        and 1 in b_strides[1:]
+        and contiguous_out
+    ):
+        return "long_k_tf32", 1, False
+    if (
+        batch == 1
+        and half
+        and out_dtype == a.dtype
+        and m >= 8192
+        and 1536 <= n <= 4096
+        and n % 192 == 0
+        and k >= 4096
+        and k % 32 == 0
+        and a.is_contiguous()
+        and b_strides[1:] == (1, k)
+        and contiguous_out
+    ):
+        return "dual_n", 1, False
+    if (
+        batch == 1
+        and a.dtype == out_dtype
+        and 1 in a_strides[1:]
+        and 1 in b_strides[1:]
+        and contiguous_out
+    ):
+        return "mm", 1, False
+    if m * n <= 32:
+        return "small", 1, False
+    if m == 1 or n == 1:
+        rows = max(m, n)
+        column = a_strides[1] < a_strides[2] if n == 1 else b_strides[2] < b_strides[1]
+        split = 1
+        if column and k >= 1024:
+            sm = get_device_properties(a.device.index).multi_processor_count
+            programs = batch * triton.cdiv(rows, 128)
+            wanted = triton.cdiv(_VECTOR_PROGRAMS_PER_SM * sm, programs)
+            split = min(_MAX_VECTOR_SPLIT_K, 1 << (wanted - 1).bit_length())
+        return "vector", split, column
+    if (
+        half
+        and out_dtype == a.dtype
+        and min(m, n) >= 1024
+        and max(m, n) <= 2 * min(m, n)
+        and 512 <= k <= 2 * min(m, n)
+        and m % 128 == n % 128 == k % 128 == 0
+        and a.is_contiguous()
+        and b.is_contiguous()
+        and contiguous_out
+    ):
+        return "dense", 1, False
+    if half and 2 <= m <= 32 and n >= 512 and k >= 512:
+        return "wide", 1, False
+    return "gemm", 1, False
+
+
+def _launch_bmm_mma(a, b, out, *, wide):
+    batch, m, k = a.shape
+    n = b.shape[2]
+    half = a.dtype in (torch.float16, torch.bfloat16)
+    if wide:
+        kernel = _bmm_wide_kernel
+    else:
+        kernel = _bmm_kernel
+        if (
+            half
+            and out.dtype == a.dtype
+            and m >= 4096
+            and n >= 4096
+            and 2048 <= k <= 4096
+            and m % 256 == 0
+            and n % 256 == 0
+            and k % 32 == 0
+            and a.is_contiguous()
+            and b.is_contiguous()
+            and out.is_contiguous()
+            and batch * k * n * a.element_size() <= _MAX_PACKING_WORKSPACE_BYTES
+        ):
+            packed = torch.empty(
+                (batch, n, k), device=b.device, dtype=b.dtype
+            ).transpose(1, 2)
+            _bmm_pack_rhs[(triton.cdiv(k, 64) * triton.cdiv(n, 128), batch)](
+                b, packed, k, n, num_warps=4
+            )
+            b = packed
+
+    def grid(meta):
+        mt, nt = (n, m) if meta["TRANSPOSE"] else (m, n)
+        return (batch * triton.cdiv(mt, meta["BM"]) * triton.cdiv(nt, meta["BN"]),)
+
+    kernel[grid](
+        a,
+        b,
+        out,
+        batch,
+        a.stride(0),
+        b.stride(0),
+        out.stride(0),
+        m,
+        n,
+        k,
+        *a.stride()[1:],
+        *b.stride()[1:],
+        *out.stride()[1:],
+        SPLIT_K=1,
+    )
+
+
 def bmm(a, b, *, out=None):
     logger.debug("GEMS METAX BMM")
     assert a.shape[0] == b.shape[0], "Batch dim mismatch"
@@ -763,20 +908,11 @@ def bmm(a, b, *, out=None):
     if not batch or not m or not n:
         return out
     a_strides, b_strides = a.stride(), b.stride()
-    half = a.dtype in (torch.float16, torch.bfloat16)
     with torch_device_fn.device(a.device):
         if not k:
             return out.zero_()
-        if (
-            a.dtype == torch.float32
-            and torch.backends.cuda.matmul.allow_tf32
-            and min(m, n) >= 1024
-            and k >= 4096
-            and k % 32 == 0
-            and a_strides[2] == 1
-            and 1 in b_strides[1:]
-            and out.is_contiguous()
-        ):
+        route, split, column = _select_bmm_route(a, b, out)
+        if route == "long_k_tf32":
             _bmm_long_k_tf32[(batch * triton.cdiv(m, 128) * triton.cdiv(n, 128),)](
                 a,
                 b,
@@ -794,19 +930,7 @@ def bmm(a, b, *, out=None):
                 pipeline="basic",
             )
             return out
-        if (
-            batch == 1
-            and half
-            and out.dtype == a.dtype
-            and m >= 8192
-            and 1536 <= n <= 4096
-            and n % 192 == 0
-            and k >= 4096
-            and k % 32 == 0
-            and a.is_contiguous()
-            and b_strides[1:] == (1, k)
-            and out.is_contiguous()
-        ):
+        if route == "dual_n":
             _bmm_dual_n[(triton.cdiv(m, 256) * triton.cdiv(n, 192),)](
                 a,
                 b,
@@ -819,16 +943,10 @@ def bmm(a, b, *, out=None):
                 pipeline="basic",
             )
             return out
-        if (
-            batch == 1
-            and a.dtype == out.dtype
-            and 1 in a_strides[1:]
-            and 1 in b_strides[1:]
-            and out.is_contiguous()
-        ):
+        if route == "mm":
             mm(a[0], b[0], out=out[0])
             return out
-        if m * n <= 32:
+        if route == "small":
             _bmm_small_kernel[(triton.cdiv(m * n, 8), batch)](
                 a,
                 b,
@@ -844,31 +962,11 @@ def bmm(a, b, *, out=None):
                 num_warps=4,
             )
             return out
-        if m == 1 or n == 1:
-            rows = max(m, n)
-            column = (
-                a_strides[1] < a_strides[2] if n == 1 else b_strides[2] < b_strides[1]
-            )
-            split = 1
-            if column and k >= 1024:
-                sm = get_device_properties(a.device.index).multi_processor_count
-                programs = batch * triton.cdiv(rows, 128)
-                wanted = triton.cdiv(_VECTOR_PROGRAMS_PER_SM * sm, programs)
-                split = min(_MAX_VECTOR_SPLIT_K, 1 << (wanted - 1).bit_length())
+        if route == "vector":
             _bmm_vector(a, b, out, split, m == 1, column)
             return out
         # Balanced dense products amortize the four-stage NN pipeline.
-        if (
-            half
-            and out.dtype == a.dtype
-            and min(m, n) >= 1024
-            and max(m, n) <= 2 * min(m, n)
-            and 512 <= k <= 2 * min(m, n)
-            and m % 128 == n % 128 == k % 128 == 0
-            and a.is_contiguous()
-            and b.is_contiguous()
-            and out.is_contiguous()
-        ):
+        if route == "dense":
             _bmm_dense_kernel[(m // 128 * (n // 128), batch)](
                 a,
                 b,
@@ -882,52 +980,7 @@ def bmm(a, b, *, out=None):
             )
             return out
 
-        if half and 2 <= m <= 32 and n >= 512 and k >= 512:
-            kernel = _bmm_wide_kernel
-        else:
-            kernel = _bmm_kernel
-            if (
-                half
-                and out.dtype == a.dtype
-                and m >= 4096
-                and n >= 4096
-                and 2048 <= k <= 4096
-                and m % 256 == 0
-                and n % 256 == 0
-                and k % 32 == 0
-                and a.is_contiguous()
-                and b.is_contiguous()
-                and out.is_contiguous()
-                and batch * k * n * a.element_size() <= _MAX_PACKING_WORKSPACE_BYTES
-            ):
-                packed = torch.empty(
-                    (batch, n, k), device=b.device, dtype=b.dtype
-                ).transpose(1, 2)
-                _bmm_pack_rhs[(triton.cdiv(k, 64) * triton.cdiv(n, 128), batch)](
-                    b, packed, k, n, num_warps=4
-                )
-                b = packed
-
-        def grid(meta):
-            mt, nt = (n, m) if meta["TRANSPOSE"] else (m, n)
-            return (batch * triton.cdiv(mt, meta["BM"]) * triton.cdiv(nt, meta["BN"]),)
-
-        kernel[grid](
-            a,
-            b,
-            out,
-            batch,
-            a.stride(0),
-            b.stride(0),
-            out.stride(0),
-            m,
-            n,
-            k,
-            *a.stride()[1:],
-            *b.stride()[1:],
-            *out.stride()[1:],
-            SPLIT_K=1,
-        )
+        _launch_bmm_mma(a, b, out, wide=route == "wide")
     return out
 
 

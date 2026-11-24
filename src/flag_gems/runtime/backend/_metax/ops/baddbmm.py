@@ -15,6 +15,7 @@ from _metax.ops.addmm import (
     _affine_bench_post_hook,
     _affine_gemm,
     _affine_matmul,
+    _affine_model_dtypes,
     _affine_vector,
     _AffineTuner,
     _prune_affine_vector,
@@ -75,10 +76,16 @@ class _BaddbmmTuner(_AffineTuner):
         values = {**dict(zip(self.arg_names, args)), **kwargs}
         if values["K"] < 1024:
             return best, timings
+
+        # The proposer returns scalar medians; exhaustive tuning returns quantiles.
+        def median(config):
+            value = timings[config]
+            return value[0] if isinstance(value, (tuple, list)) else value
+
         finalists = [
             config
-            for config in sorted(timings, key=timings.get)[:16]
-            if timings[config][0] < float("inf")
+            for config in sorted(timings, key=median)[:16]
+            if median(config) < float("inf")
         ]
         if len(finalists) < 2:
             return best, timings
@@ -205,6 +212,10 @@ def _prune_baddbmm_gemm(configs, named_args, **kwargs):
     post_hook=_affine_bench_post_hook,
     flagtune_op_name="baddbmm",
     flagtune_expand_op_name="baddbmm_gemm",
+    flagtune_op_id="flaggems/baddbmm",
+    flagtune_variant="gemm",
+    flagtune_dtype_resolver=_affine_model_dtypes,
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=30,
 )
@@ -293,6 +304,10 @@ def _baddbmm_gemm_kernel(
     post_hook=_affine_bench_post_hook,
     flagtune_op_name="baddbmm",
     flagtune_expand_op_name="baddbmm_vector",
+    flagtune_op_id="flaggems/baddbmm",
+    flagtune_variant="vector",
+    flagtune_dtype_resolver=_affine_model_dtypes,
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
     rep=30,
 )

@@ -63,8 +63,12 @@ _KEY = ["M", "K", "BATCH", "SAB", "SAM", "SAK", "SXB", "SXK", "SYB", "SYM", "SPL
     key=["M", "K", "SAM", "SAK", "SXK", "SYM"],
     prune_configs_by={"early_config_prune": _prune_tiles},
     rep=20,
+    policy="flagtune",
+    flagtune_op_id="flaggems/mv",
+    flagtune_variant="row",
     flagtune_op_name="mv_row",
     flagtune_expand_op_name="mv_row",
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
 )
 @triton.jit
@@ -97,16 +101,6 @@ def _mv_row_kernel(
     tl.store(Y + rows * SYM, tl.sum(acc, axis=1), rows < M)
 
 
-@libentry()
-@libtuner(
-    configs=runtime.get_tuned_config("mv_column"),
-    key=_KEY,
-    prune_configs_by={"early_config_prune": _prune_tiles},
-    rep=20,
-    flagtune_op_name="mv_column",
-    flagtune_expand_op_name="mv_column",
-    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
-)
 @triton.jit
 def _mv_column_kernel(
     A,
@@ -146,6 +140,28 @@ def _mv_column_kernel(
     tl.store(Y + batch * SYB + part * M + rows * SYM, values, rows < M)
 
 
+def _column_tuner(variant):
+    return libentry()(
+        libtuner(
+            configs=runtime.get_tuned_config("mv_column"),
+            key=_KEY,
+            prune_configs_by={"early_config_prune": _prune_tiles},
+            rep=20,
+            policy="flagtune",
+            flagtune_op_name="mv_column",
+            flagtune_expand_op_name="mv_column",
+            flagtune_op_id="flaggems/mv",
+            flagtune_variant=variant,
+            use_cuda_graph=True,
+            flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+        )(_mv_column_kernel)
+    )
+
+
+_mv_column_entry = _column_tuner("column")
+_mv_column_partial_entry = _column_tuner("column_partial")
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("mv_reduce"),
@@ -156,6 +172,7 @@ def _mv_column_kernel(
     rep=20,
     flagtune_op_name="mv_reduce",
     flagtune_expand_op_name="mv_reduce",
+    use_cuda_graph=True,
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
 )
 @triton.jit
@@ -242,7 +259,8 @@ def _launch_column(call, split_k=-1):
         target_strides = (split_k * call.m, 1)
     else:
         target, target_strides = call.out, (0, call.out_stride)
-    _mv_column_kernel[lambda cfg: (triton.cdiv(call.m, cfg["BLOCK_N"]), split_k, 1)](
+    kernel = _mv_column_partial_entry if split_k > 1 else _mv_column_entry
+    kernel[lambda cfg: (triton.cdiv(call.m, cfg["BLOCK_N"]), split_k, 1)](
         call.a,
         call.x,
         target,

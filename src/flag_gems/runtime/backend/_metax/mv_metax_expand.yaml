@@ -1,46 +1,34 @@
-# Expanded MV search spaces for FlagTune. Only consulted in EXPANDED tuning
-# mode, so tune_configs.yaml keeps the typical candidates used at runtime.
-#
-# Generator source names upper-case to the kernel's META parameters: `block_n`
-# feeds BLOCK_N, `block_m` feeds BLOCK_M, `block` feeds BLOCK. Tiles that
-# overrun MetaX private memory are dropped later by _prune_tiles rather than
-# being excluded here.
-#
-# The row and column kernels sweep mirrored spaces on purpose. Each keeps the
-# matrix's unit-stride axis on the tile's inner dimension, so the row kernel
-# wants a wide BLOCK_M and the column kernel a wide BLOCK_N.
-
+# Row loads favor long reduction tiles. Column loads favor wide row tiles.
+# Group the combinations to preserve the default configs and avoid large
+# tiles at small warp counts. The runtime also prunes for each shape.
 mv_row:
   - config:
-    param_map:
-      META:
-        BLOCK_N: block_n
-        BLOCK_M: block_m
+    param_map: &mv_params
+      META: {BLOCK_N: block_n, BLOCK_M: block_m}
       num_stages: stages
       num_warps: warps
-    block_n:
-      - 1
-      - 2
-      - 4
-      - 8
-      - 16
-      - 32
-      - 64
-    block_m:
-      - 64
-      - 128
-      - 256
-      - 512
-      - 1024
-      - 2048
-      - 4096
-    stages:
-      - 1
-    warps:
-      - 1
-      - 2
-      - 4
-      - 8
+    block_n: [1, 2, 4]
+    block_m: [128, 256, 512, 1024, 2048, 4096]
+    stages: [1]
+    warps: [2, 4, 8]
+  - config:
+    param_map: *mv_params
+    block_n: [1, 2, 4]
+    block_m: [64, 128, 256]
+    stages: [1]
+    warps: [1]
+  - config:
+    param_map: *mv_params
+    block_n: [8, 16]
+    block_m: [128, 256, 512, 1024]
+    stages: [1]
+    warps: [2, 4, 8]
+  - config:
+    param_map: *mv_params
+    block_n: [32, 64]
+    block_m: [64, 128, 256]
+    stages: [1]
+    warps: [4, 8]
   - strategy:
       M: align32
       K: align32
@@ -51,38 +39,41 @@ mv_row:
 
 mv_column:
   - config:
-    param_map:
-      META:
-        BLOCK_N: block_n
-        BLOCK_M: block_m
-      num_stages: stages
-      num_warps: warps
-    block_n:
-      - 1
-      - 2
-      - 4
-      - 8
-      - 16
-      - 32
-      - 64
-      - 128
-      - 256
-      - 512
-      - 1024
-    block_m:
-      - 16
-      - 32
-      - 64
-      - 128
-      - 256
-      - 512
-    stages:
-      - 1
-    warps:
-      - 1
-      - 2
-      - 4
-      - 8
+    param_map: *mv_params
+    block_n: [1, 2, 4, 8]
+    block_m: [32, 64, 128, 256]
+    stages: [1]
+    warps: [1, 2]
+  - config:
+    param_map: *mv_params
+    block_n: [16, 32, 64, 128]
+    block_m: [16, 32, 64, 128]
+    stages: [1]
+    warps: [1, 2, 4]
+  - config:
+    param_map: *mv_params
+    block_n: [256, 512]
+    block_m: [16, 32, 64]
+    stages: [1]
+    warps: [4, 8]
+  - config:
+    param_map: *mv_params
+    block_n: [1024]
+    block_m: [16, 32]
+    stages: [1]
+    warps: [8]
+  - config:
+    param_map: *mv_params
+    block_n: [256]
+    block_m: [128]
+    stages: [1]
+    warps: [8]
+  - config:
+    param_map: *mv_params
+    block_n: [16, 32]
+    block_m: [256, 512]
+    stages: [1]
+    warps: [4]
   - strategy:
       M: align32
       K: align32
