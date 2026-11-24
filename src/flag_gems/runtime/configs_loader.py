@@ -180,6 +180,8 @@ class TunedConfigLoader(object):
                 "column_gemv_ascend": ("BM", "BK"),
                 "mv_column_ascend": ("BLOCK_N", "BLOCK_K", "CHUNK_K"),
                 "mm_narrow_gemv_ascend": ("BLOCK_OUT", "BLOCK_K"),
+                "nt_split_ascend": ("BLOCK_M", "BLOCK_N", "BLOCK_K", "SPLITS"),
+                "split_k_ascend": ("BM", "BN", "BK", "SPLIT"),
                 "mm_rectangular_ascend": ("BLOCK_M", "BLOCK_N", "BLOCK_K"),
                 "mm_packed_narrow_ascend": ("BM", "BK"),
                 "panel_gemm_ascend": ("BM", "BK"),
@@ -1101,25 +1103,31 @@ class TunedConfigLoader(object):
             },
             **{
                 name: {"key": ["M", "N", "K"], "default_strategy": ["default"] * 3}
-                for name in ("mm_rectangular_ascend", "panel_gemm_ascend")
+                for name in (
+                    "mm_rectangular_ascend",
+                    "panel_gemm_ascend",
+                    "nt_split_ascend",
+                )
             },
             "mm_packed_narrow_ascend": {
                 "key": ["M", "N", "K", "rhs_stride_k", "rhs_stride_n"],
                 "default_strategy": ["default"] * 5,
             },
-            "tiled_gemm_ascend": {
-                "yaml_op_name": "tiled_gemm_ascend",
-                "key": [
-                    "BATCH",
-                    "M",
-                    "N",
-                    "K",
-                    "TRANSPOSED",
-                    "WITH_BIAS",
-                    "HINT",
-                    "a_batch_stride",
-                ],
-                "default_strategy": ["default"] * 8,
+            **{
+                name: {
+                    "key": [
+                        "BATCH",
+                        "M",
+                        "N",
+                        "K",
+                        "TRANSPOSED",
+                        "WITH_BIAS",
+                        "HINT",
+                        "a_batch_stride",
+                    ],
+                    "default_strategy": ["default"] * 8,
+                }
+                for name in ("tiled_gemm_ascend", "split_k_ascend")
             },
             "router_gemm_ascend": {
                 "key": ["M", "N", "K", "XM", "XK", "WN", "WK", "SPLIT"],

@@ -108,6 +108,19 @@ mm_narrow_gemv_ascend:
     stages: *gemm_one_stage
     warps: *gemm_warps
 
+nt_split_ascend:
+  - config:
+    param_map:
+      META: {BLOCK_M: block_m, BLOCK_N: block_n, BLOCK_K: block_k, SPLITS: splits}
+      num_stages: stages
+      num_warps: warps
+    block_m: [16, 32, 64]
+    block_n: [32, 64, 128]
+    block_k: [128, 256]
+    splits: [2, 4, 8]
+    stages: [2]
+    warps: [32]
+
 mm_rectangular_ascend:
   - config:
     param_map:

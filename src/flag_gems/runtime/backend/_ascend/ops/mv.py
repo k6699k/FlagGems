@@ -31,6 +31,7 @@ from .bmm import (
     _UB_BYTES,
     AscendBlasTuner,
     is_ascend_910b,
+    tune_fixed_gemm,
     vector_tile_fits_910b,
 )
 
@@ -308,10 +309,7 @@ def _launch_column_mv(inp, vec, out, n, k):
     chunk = _COLUMN_MIN_CHUNK if split else 0
     block_n = _COLUMN_SPLIT_BLOCK_N if split else _COLUMN_DIRECT_BLOCK_N
     splits = triton.cdiv(k, chunk) if split else 1
-    tune = (
-        mv_column_kernel.fn._run_mode is not LibTunerRunMode.NORMAL
-        or runtime.flagtune_enabled("mv_column")
-    )
+    tune = tune_fixed_gemm(mv_column_kernel)
     # Reserve a row pitch large enough for every candidate's padded output tile.
     row_alignment = _COLUMN_MAX_BLOCK_N if tune else block_n
     padded_n = triton.cdiv(n, row_alignment) * row_alignment

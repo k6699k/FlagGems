@@ -49,6 +49,7 @@ from .bmm import (
     _use_narrow_pack,
     _use_nt_gemm,
     bmm,
+    bmm_split_kernel,
 )
 
 logger = logging.getLogger(__name__)
@@ -420,7 +421,9 @@ class BaddbmmFunction(torch.autograd.Function):
                 if route == "direct_nt_tiled"
                 else baddbmm_tiled_kernel
             )
-            return _launch_tiled_gemm(A, B, out, tile, bias, tuner=tuner)
+            return _launch_tiled_gemm(
+                A, B, out, tile, bias, tuner=tuner, split_tuner=bmm_split_kernel
+            )
         if route == "column_gemv":
             return _launch_column_gemv(
                 A, B, out, bias, tuner=baddbmm_column_gemv_kernel

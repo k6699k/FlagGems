@@ -375,6 +375,7 @@ def _mm_nt_split_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SPLITS: tl.constexpr,
+    Out=None,
 ):
     split = tl.program_id(1)
     for pid in range(
@@ -415,6 +416,72 @@ def _mm_nt_merge(P, C, MN: tl.constexpr, SPLITS: tl.constexpr, BLOCK: tl.constex
         partial = tl.load(P + ss[:, None] * MN + idx[None, :], idx[None, :] < MN, 0)
         out = tl.sum(partial, axis=0)
         tl.store(C + idx, out.to(C.dtype.element_ty), idx < MN)
+
+
+def _finish_mm_nt_split(partial, out, m, n, splits):
+    _mm_nt_merge[_mm_capped_grid(triton.cdiv(m * n, 256))](
+        partial, out, m * n, splits, 256
+    )
+
+
+def _prune_mm_nt_split(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    m, n, k = (args[key] for key in ("M", "N", "K"))
+    valid = []
+    for config in configs:
+        bm, bn, bk, splits = (
+            config.kwargs[key] for key in ("BLOCK_M", "BLOCK_N", "BLOCK_K", "SPLITS")
+        )
+        if bm > max(16, triton.next_power_of_2(m)):
+            continue
+        if bn > max(64, triton.next_power_of_2(n)):
+            continue
+        if splits == 8 and (k % (bk * splits) or bn > 64 or bm > 32):
+            continue
+        if k % 128 and (bn > 64 or bk > 128 or bm > 32):
+            continue
+        valid.append(config)
+    if is_ascend_910b():
+        return prune_cube_tiles_910b(
+            valid, args["A"].dtype, ("BLOCK_M", "BLOCK_N", "BLOCK_K")
+        )
+    return valid
+
+
+def _bench_mm_nt_split_merge(args, *, exception):
+    if exception is None:
+        _finish_mm_nt_split(
+            args["C"], args["Out"], args["M"], args["N"], args["SPLITS"]
+        )
+
+
+mm_nt_split_tuned = libentry()(
+    libtuner(
+        configs=[
+            triton.Config(
+                dict(BLOCK_M=bm, BLOCK_N=64, BLOCK_K=128, SPLITS=4),
+                num_warps=32,
+                num_stages=2,
+            )
+            for bm in (16, 32)
+        ],
+        key=["M", "N", "K"],
+        prune_configs_by={"early_config_prune": _prune_mm_nt_split},
+        post_hook=_bench_mm_nt_split_merge,
+        use_cuda_graph=True,
+        rep=20,
+        policy=AscendBlasTuner,
+        flagtune_op_name="mm",
+        flagtune_op_id="flaggems/mm",
+        flagtune_variant="nt_split",
+        flagtune_expand_op_name="nt_split_ascend",
+        flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
+        flagtune_dtype_resolver=lambda args: tuple(
+            args[name].dtype for name in ("A", "B", "Out")
+        ),
+        disable_aabs=True,
+    )(_mm_nt_split_kernel.jit_function)
+)
 
 
 @libentry()
@@ -798,11 +865,18 @@ def _mm_persistent_smallk_kernel(
 
 def _prune_mm_rectangular(configs, named_args, **kwargs):
     args = {**named_args, **kwargs}
+    m, n = args["M"], args["N"]
+    if m <= 16 and n <= 64:
+        # A larger tile only increases padding for a single small output tile.
+        configs = [
+            cfg
+            for cfg in configs
+            if cfg.kwargs["BLOCK_M"] <= 16 and cfg.kwargs["BLOCK_N"] <= 64
+        ]
     if is_ascend_910b():
         return prune_cube_tiles_910b(
             configs, args["A"].dtype, ("BLOCK_M", "BLOCK_N", "BLOCK_K")
         )
-    m, n = args["M"], args["N"]
     return [
         cfg
         for cfg in configs
@@ -853,7 +927,8 @@ def prune_panel_gemm(configs, named_args, **kwargs):
     return [
         cfg
         for cfg in configs
-        if k % cfg.kwargs["BK"] == 0
+        if (m > 16 or cfg.kwargs["BM"] <= 16)
+        and k % cfg.kwargs["BK"] == 0
         and (
             cube_tile_fits_910b(
                 cfg.kwargs["BM"],
@@ -874,7 +949,7 @@ def launch_panel_gemm(kernel, tuner, operands, shape, bm, bk):
     bn = 256
     panels = triton.cdiv(n, bn)
     options = dict(multibuffer=True, unit_flag=True, sync_solver=False)
-    if tune_fixed_gemm(tuner):
+    if triton.cdiv(m, bm) * panels <= 65535 and tune_fixed_gemm(tuner):
 
         def grid(meta):
             return (min(triton.cdiv(m, meta["BM"]) * panels, 65535),)
@@ -885,10 +960,12 @@ def launch_panel_gemm(kernel, tuner, operands, shape, bm, bk):
         kernel[grid](*operands, *shape, bm, bn, bk, **options)
 
 
-def _make_mm_fixed_tuner(kernel, variant, key, preset, prune, space, *, stages=2):
+def _make_mm_fixed_tuner(kernel, variant, key, presets, prune, space):
     return libentry()(
         libtuner(
-            configs=[triton.Config(preset, num_warps=4, num_stages=stages)],
+            configs=[
+                triton.Config(preset, num_warps=32, num_stages=2) for preset in presets
+            ],
             key=key,
             prune_configs_by={"early_config_prune": prune},
             use_cuda_graph=True,
@@ -907,7 +984,17 @@ mm_rectangular_kernel = _make_mm_fixed_tuner(
     _mm_rectangular_kernel.fn,
     "rectangular",
     ["M", "N", "K"],
-    {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 256},
+    [
+        dict(BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+        for bm, bn, bk in (
+            (16, 64, 256),
+            (16, 256, 256),
+            (32, 256, 256),
+            (128, 128, 128),
+            (128, 256, 128),
+            (128, 256, 256),
+        )
+    ],
     _prune_mm_rectangular,
     "mm_rectangular",
 )
@@ -915,17 +1002,16 @@ mm_narrow_gemv_kernel = _make_mm_fixed_tuner(
     _mm_narrow_n_kernel.fn,
     "narrow_gemv",
     ["M", "K"],
-    {"BLOCK_OUT": 4, "BLOCK_K": 1024},
+    [dict(BLOCK_OUT=4, BLOCK_K=bk) for bk in (128, 256, 512, 1024, 2048)],
     _prune_mm_narrow_gemv,
     "mm_narrow_gemv",
-    stages=1,
 )
 _PACKED_NARROW_KEY = ["M", "N", "K", "rhs_stride_k", "rhs_stride_n"]
 mm_packed_narrow_kernel = _make_mm_fixed_tuner(
     _mm_packed_narrow_kernel,
     "packed_narrow",
     _PACKED_NARROW_KEY,
-    {"BM": 64, "BK": 512},
+    [dict(BM=bm, BK=bk) for bm, bk in ((16, 512), (16, 1024), (64, 1024))],
     _prune_mm_packed_narrow,
     "mm_packed_narrow",
 )
@@ -933,7 +1019,7 @@ mm_packed_narrow_nt_kernel = _make_mm_fixed_tuner(
     _mm_packed_narrow_kernel,
     "packed_narrow_nt",
     _PACKED_NARROW_KEY,
-    {"BM": 16, "BK": 512},
+    [dict(BM=bm, BK=bk) for bm, bk in ((16, 512), (16, 1024), (64, 1024))],
     _prune_mm_packed_narrow,
     "mm_packed_narrow",
 )
@@ -944,7 +1030,7 @@ mm_wide_panel_kernel = _make_mm_fixed_tuner(
     _mm_wide_panel_cube_kernel,
     "wide_panels",
     ["M", "N", "K"],
-    {"BM": 128, "BK": 128},
+    [dict(BM=bm, BK=128) for bm in (16, 128)],
     prune_panel_gemm,
     "panel_gemm",
 )
@@ -956,7 +1042,7 @@ def _launch_mm_packed_narrow(
     m, k = a.shape
     n = out.shape[1]
     options = dict(multibuffer=True, unit_flag=True, sync_solver=False)
-    if tune_fixed_gemm(tuner):
+    if triton.cdiv(m, bm) <= 65535 and tune_fixed_gemm(tuner):
         tuner[lambda meta: _mm_capped_grid(triton.cdiv(m, meta["BM"]))](
             a,
             packed,
@@ -979,7 +1065,9 @@ def _launch_mm_rectangular(a, b, out, bm, bn, bk):
     n = b.shape[1]
     options = dict(multibuffer=True, unit_flag=True, sync_solver=False)
     with torch_device_fn.device(a.device), _blockified():
-        if tune_fixed_gemm(mm_rectangular_kernel):
+        if triton.cdiv(m, bm) * triton.cdiv(n, bn) <= 65535 and tune_fixed_gemm(
+            mm_rectangular_kernel
+        ):
 
             def grid(meta):
                 return _mm_capped_grid(
@@ -1134,6 +1222,29 @@ def _launch_mm_nt(a, b, route):
     c = torch.empty((m, n), device=a.device, dtype=a.dtype)
     with torch_device_fn.device(a.device), _blockified():
         if route == "nt_split":
+            if a.dtype == torch.bfloat16 and tune_fixed_gemm(mm_nt_split_tuned):
+                partial = torch.empty((8, m, n), device=a.device, dtype=torch.float32)
+
+                def grid(meta):
+                    tiles = triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(
+                        n, meta["BLOCK_N"]
+                    )
+                    return (*_mm_capped_grid(tiles), meta["SPLITS"])
+
+                _, selected = mm_nt_split_tuned[grid](
+                    a,
+                    b,
+                    partial,
+                    m,
+                    n,
+                    k,
+                    Out=c,
+                    multibuffer=True,
+                    unit_flag=True,
+                    sync_solver=False,
+                )
+                _finish_mm_nt_split(partial, c, m, n, selected["SPLITS"])
+                return c
             splits = 4
             bm = 16 if m <= 16 else 32
             bn = 64
@@ -1154,9 +1265,7 @@ def _launch_mm_nt(a, b, route):
                 unit_flag=True,
                 sync_solver=False,
             )
-            _mm_nt_merge[_mm_capped_grid(triton.cdiv(m * n, 256))](
-                partial, c, m * n, splits, 256
-            )
+            _finish_mm_nt_split(partial, c, m, n, splits)
         else:
             bm = 16 if m <= 16 else (32 if m <= 32 else 128)
             bn = 16 if n <= 16 else (64 if n <= 64 else 256)
@@ -1226,10 +1335,7 @@ def _select_mm_route(a, b):
     ):
         return "packed_narrow_nt" if b.T.is_contiguous() else "packed_narrow4"
     nt_route = _select_mm_nt_route(a, b)
-    # Preserve the existing split-K route until the tiled tuner is selected.
-    if _select_direct_nt_tile(a, b) is not None and (
-        nt_route != "nt_split" or tune_fixed_gemm(mm_direct_nt_kernel)
-    ):
+    if nt_route != "nt_split" and _select_direct_nt_tile(a, b) is not None:
         return "direct_nt_tiled"
     if nt_route is not None:
         return nt_route
@@ -1383,7 +1489,7 @@ def mm(a, b):
         return _launch_mm_short_reduction(a, b, c, tiny=route == "tiny_reduction")
     if route == "narrow_gemv":
         with torch_device_fn.device(device):
-            if tune_fixed_gemm(mm_narrow_gemv_kernel):
+            if triton.cdiv(M, 4) <= 65535 and tune_fixed_gemm(mm_narrow_gemv_kernel):
                 mm_narrow_gemv_kernel[
                     lambda meta: _mm_capped_grid(triton.cdiv(M, meta["BLOCK_OUT"]))
                 ](a, b, c, M, N, K)

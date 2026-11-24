@@ -29,7 +29,7 @@ from flag_gems.utils import libentry, libtuner
 from flag_gems.utils.libentry import LibTuner
 from flag_gems.utils.shape_utils import volume
 
-from .bmm import _bench_ascend_graph
+from .bmm import AscendBlasTuner, _bench_ascend_graph
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,7 @@ def mul_persistent_kernel(
     BLOCK_SIZE: tl.constexpr,
     SCALAR: tl.constexpr,
     FULL_BLOCKS: tl.constexpr,
+    VECTOR_CORES: tl.constexpr = 0,
 ):
     pid = tl.program_id(0)
     programs = tl.num_programs(0)
@@ -80,11 +81,54 @@ def mul_persistent_kernel(
         tl.store(output_ptr + offsets, x * y, mask=mask)
 
 
+def _prune_persistent_mul(configs, named_args, **kwargs):
+    max_block = max(128, triton.next_power_of_2(named_args["n_elements"]))
+    return [cfg for cfg in configs if cfg.kwargs["BLOCK_SIZE"] <= max_block]
+
+
+_mul_persistent_default = libentry()(
+    libtuner(
+        configs=[
+            triton.Config(dict(BLOCK_SIZE=block), num_warps=4, num_stages=1)
+            for block in (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+        ],
+        key=["n_elements", "SCALAR", "VECTOR_CORES"],
+        prune_configs_by={"early_config_prune": _prune_persistent_mul},
+        use_cuda_graph=True,
+        rep=20,
+        policy=AscendBlasTuner,
+        disable_aabs=True,
+    )(
+        triton.heuristics(
+            {"FULL_BLOCKS": lambda args: args["n_elements"] % args["BLOCK_SIZE"] == 0}
+        )(mul_persistent_kernel.jit_function)
+    )
+)
+
+
 def _launch_persistent_mul(tensor, other, output, *, scalar=False):
     n = output.numel()
     if n == 0:
         return output
     cores = _mul_vector_cores(output.device.index)
+    rhs = tensor if scalar else other
+    ptr = output.untyped_storage().data_ptr()
+    if output.dtype in (torch.bfloat16, torch.float32) and all(
+        ptr != operand.untyped_storage().data_ptr() for operand in (tensor, rhs)
+    ):
+        with torch_device_fn.device(output.device):
+            _mul_persistent_default[
+                lambda meta: (min(triton.cdiv(n, meta["BLOCK_SIZE"]), cores),)
+            ](
+                tensor,
+                rhs,
+                output,
+                other if scalar else 0,
+                n,
+                SCALAR=scalar,
+                VECTOR_CORES=cores,
+            )
+        return output
     # Bound both the UB footprint and the number of scheduled programs.
     # Balance adjacent blocks across programs to keep HBM accesses contiguous.
     block = min(16384, max(128, triton.next_power_of_2(triton.cdiv(n, cores))))
@@ -93,7 +137,7 @@ def _launch_persistent_mul(tensor, other, output, *, scalar=False):
     with torch_device_fn.device(output.device):
         mul_persistent_kernel[(grid,)](
             tensor,
-            tensor if scalar else other,
+            rhs,
             output,
             other if scalar else 0,
             n,
@@ -932,6 +976,34 @@ def _can_use_tiled_broadcast(a_t, b_t, output, a_stride, b_stride, dtype):
     )
 
 
+def _prune_mul_narrow_outer(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    m, n = args["M"], args["N"]
+    return [
+        cfg
+        for cfg in configs
+        if cfg.kwargs["BLOCK_M"] <= max(16, triton.next_power_of_2(m))
+        and cfg.kwargs["BLOCK_M"] * triton.next_power_of_2(n) <= 16384
+        and triton.cdiv(m, cfg.kwargs["BLOCK_M"]) <= _MUL_MAX_GRID
+    ]
+
+
+_mul_narrow_outer_default = libentry()(
+    libtuner(
+        configs=[
+            triton.Config(dict(BLOCK_M=bm), num_warps=4, num_stages=1)
+            for bm in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+        ],
+        key=["M", "N", "ROW_STRIDE", "COL_STRIDE"],
+        prune_configs_by={"early_config_prune": _prune_mul_narrow_outer},
+        use_cuda_graph=True,
+        rep=20,
+        policy=AscendBlasTuner,
+        disable_aabs=True,
+    )(mul_narrow_broadcast_kernel.jit_function)
+)
+
+
 def _launch_narrow_outer(a_t, b_t, output, out_shape, a_stride, b_stride, block_m):
     m, n = out_shape
     row_on_lhs = a_stride[1] == 0
@@ -940,6 +1012,18 @@ def _launch_narrow_outer(a_t, b_t, output, out_shape, a_stride, b_stride, block_
         (a_stride[0], b_stride[1]) if row_on_lhs else (b_stride[0], a_stride[1])
     )
     with torch_device_fn.device(output.device):
+        if output.dtype in (torch.bfloat16, torch.float32):
+            _mul_narrow_outer_default[lambda meta: (triton.cdiv(m, meta["BLOCK_M"]),)](
+                row,
+                col,
+                output,
+                m,
+                N=n,
+                ROW_STRIDE=row_stride,
+                COL_STRIDE=col_stride,
+                BLOCK_N=triton.next_power_of_2(n),
+            )
+            return output
         mul_narrow_broadcast_kernel[(triton.cdiv(m, block_m),)](
             row,
             col,

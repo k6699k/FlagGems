@@ -104,6 +104,19 @@ panel_gemm_ascend:
     stages: [1, 2]
     warps: *gemm_warps
 
+split_k_ascend:
+  - config:
+    param_map:
+      META: {BM: bm, BN: bn, BK: bk, SPLIT: split}
+      num_stages: stages
+      num_warps: warps
+    bm: [16, 32]
+    bn: [32, 64, 128]
+    bk: [128, 256]
+    split: [1, 2, 4, 8]
+    stages: [2]
+    warps: [32]
+
 tiled_gemm_ascend:
   - config:
     param_map: &tiled_params

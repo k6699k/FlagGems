@@ -34,6 +34,7 @@ from .bmm import (
     _launch_nt_gemm,
     _launch_tiled_gemm,
     _make_gemv_tuner,
+    _make_split_gemm_tuner,
     _make_tiled_gemm_tuner,
     _narrow_gemv_kernel,
     _prune_narrow_gemv,
@@ -55,6 +56,9 @@ _ADDMM_EXPAND_PATH = str(
 
 addmm_tiled_kernel = _make_tiled_gemm_tuner(
     "addmm", "tiled_gemm", _prune_tiled_gemm_configs, yaml_path=_ADDMM_EXPAND_PATH
+)
+addmm_split_kernel = _make_split_gemm_tuner(
+    op_name="addmm", yaml_path=_ADDMM_EXPAND_PATH
 )
 addmm_narrow_gemv_kernel = _make_gemv_tuner(
     _narrow_gemv_kernel,
@@ -538,13 +542,43 @@ def _addmm_scalar_dot(A, B, Bias, Out, K: tl.constexpr, BLOCK_K: tl.constexpr):
 
 
 @triton.jit
-def _addmm_row_vector(A, B, Bias, Out, N: tl.constexpr, K: tl.constexpr):
+def _addmm_row_vector(
+    A, B, Bias, Out, N: tl.constexpr, K: tl.constexpr, BN: tl.constexpr = 64
+):
     k = tl.arange(0, K)
-    n = tl.program_id(0) * 64 + tl.arange(0, 64)
+    n = tl.program_id(0) * BN + tl.arange(0, BN)
     a = tl.load(A + k).to(tl.float32)
     b = tl.load(B + k[:, None] * N + n[None, :]).to(tl.float32)
     value = tl.sum(a[:, None] * b, axis=0) + tl.load(Bias + n).to(tl.float32)
     tl.store(Out + n, value)
+
+
+def _prune_addmm_row_vector(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    n, k = args["N"], args["K"]
+    return [
+        cfg
+        for cfg in configs
+        if n % cfg.kwargs["BN"] == 0
+        and n // cfg.kwargs["BN"] <= 65535
+        and k * cfg.kwargs["BN"] <= 16384
+    ]
+
+
+_addmm_row_vector_default = libentry()(
+    libtuner(
+        configs=[
+            triton.Config(dict(BN=bn), num_warps=32, num_stages=2)
+            for bn in (16, 32, 64, 128, 256)
+        ],
+        key=["N", "K"],
+        prune_configs_by={"early_config_prune": _prune_addmm_row_vector},
+        use_cuda_graph=True,
+        rep=20,
+        policy=AscendBlasTuner,
+        disable_aabs=True,
+    )(_addmm_row_vector)
+)
 
 
 @triton.jit
@@ -580,7 +614,10 @@ def _addmm_wide_panel_kernel(
 
 addmm_wide_panel_kernel = libentry()(
     libtuner(
-        configs=[triton.Config({"BM": 128, "BK": 256}, num_warps=4, num_stages=2)],
+        configs=[
+            triton.Config(dict(BM=bm, BK=256), num_warps=32, num_stages=2)
+            for bm in (16, 128)
+        ],
         key=["M", "N", "K"],
         prune_configs_by={"early_config_prune": prune_panel_gemm},
         use_cuda_graph=True,
@@ -723,10 +760,23 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
     if route == "wide_panels":
         return _launch_wide_addmm(mat1, mat2, bias, out)
     if tile is not None:
-        return _launch_tiled_gemm(mat1, mat2, out, tile, bias, tuner=addmm_tiled_kernel)
+        return _launch_tiled_gemm(
+            mat1,
+            mat2,
+            out,
+            tile,
+            bias,
+            tuner=addmm_tiled_kernel,
+            split_tuner=addmm_split_kernel,
+        )
     if route == "row_vector":
         with torch_device_fn.device(mat1.device):
-            _addmm_row_vector[(N // 64,)](mat1, mat2, bias, out, N, K)
+            if mat1.dtype == torch.bfloat16:
+                _addmm_row_vector_default[lambda meta: (N // meta["BN"],)](
+                    mat1, mat2, bias, out, N, K
+                )
+            else:
+                _addmm_row_vector[(N // 64,)](mat1, mat2, bias, out, N, K)
         return out
     if route == "scalar_dot":
         with torch_device_fn.device(mat1.device):

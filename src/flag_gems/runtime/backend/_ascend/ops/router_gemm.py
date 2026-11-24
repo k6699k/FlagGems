@@ -218,7 +218,28 @@ def _prune_router_cube_configs(configs, named_args, **kwargs):
 
 router_cube_tuned = libentry()(
     libtuner(
-        configs=[triton.Config({"BM": 16, "BN": 16, "BK": 128}, num_stages=1)],
+        configs=[
+            triton.Config(dict(BM=bm, BN=bn, BK=bk), num_warps=32, num_stages=2)
+            for bm, bn in (
+                (16, 16),
+                (16, 32),
+                (16, 64),
+                (16, 128),
+                (32, 16),
+                (32, 64),
+                (32, 128),
+                (64, 16),
+                (64, 64),
+                (64, 128),
+                (128, 16),
+                (128, 32),
+                (128, 64),
+                (128, 128),
+                (256, 64),
+                (256, 128),
+            )
+            for bk in (128, 256, 512)
+        ],
         key=["M", "N", "K", "XM", "XK", "WN", "WK", "SPLIT"],
         prune_configs_by={"early_config_prune": _prune_router_cube_configs},
         use_cuda_graph=True,
