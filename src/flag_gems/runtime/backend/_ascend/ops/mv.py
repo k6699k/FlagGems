@@ -31,8 +31,8 @@ from .bmm import _FP32_BYTES, _UB_BYTES, is_ascend_910b, vector_tile_fits_910b
 logger = logging.getLogger(__name__)
 _MV_EXPAND_PATH = str(Path(__file__).resolve().parent.parent / "mv_ascend_expand.yaml")
 _MV_MAX_GRID = 65535
-# BLOCK_M=128, BLOCK_N=16 fits 910B UB even with a strided reduction.
-_MV_910B_MAX_ROWS = 16 * _MV_MAX_GRID
+# BLOCK_M=128, BLOCK_N=16 fits the general-path UB limit even with strides.
+_MV_GENERAL_MAX_ROWS = 16 * _MV_MAX_GRID
 register_flagtune_op(
     "mv_column", description="matrix-vector multiplication over a column-major matrix"
 )
@@ -51,7 +51,8 @@ def _prune_mv_configs(configs, named_args, **kwargs):
     valid = []
     for config in configs:
         block_m, block_n = (config.kwargs[key] for key in ("BLOCK_M", "BLOCK_N"))
-        if triton.cdiv(args["N"], block_n) > _MV_MAX_GRID:
+        # Bound UB use for FP32 accumulators and lowering temporaries.
+        if block_m * block_n > 4096 or triton.cdiv(args["N"], block_n) > _MV_MAX_GRID:
             continue
         if is_910b:
             # The legacy strided gather needs additional UB scratch.
@@ -125,9 +126,8 @@ def mv_kernel(
 
 def _launch_general_mv(inp, vec, out):
     n, k = inp.shape
-    max_rows = _MV_910B_MAX_ROWS if is_ascend_910b() else n
-    for start in range(0, n, max_rows):
-        rows = min(n - start, max_rows)
+    for start in range(0, n, _MV_GENERAL_MAX_ROWS):
+        rows = min(n - start, _MV_GENERAL_MAX_ROWS)
         matrix, result = inp, out
         if rows < n:
             matrix = inp[start : start + rows]
@@ -348,6 +348,88 @@ def _launch_column_mv(inp, vec, out, n, k):
         )
 
 
+@libentry()
+@triton.jit
+def _mv_column_major(
+    A,
+    B,
+    C,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    STRIDE_AK: tl.constexpr,
+    STRIDE_BK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    CHUNK_K: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    split = tl.program_id(1)
+    ks = split * CHUNK_K + tl.arange(0, BLOCK_K)
+    acc = tl.zeros((BLOCK_K, BLOCK_N), dtype=tl.float32)
+    for offset in range(0, CHUNK_K, BLOCK_K):
+        k = ks + offset
+        a = tl.load(
+            A + k[:, None].to(tl.int64) * STRIDE_AK + rows[None, :],
+            (k[:, None] < K) & (rows[None, :] < N),
+            other=0,
+        ).to(tl.float32)
+        b = tl.load(B + k.to(tl.int64) * STRIDE_BK, k < K, other=0).to(tl.float32)
+        acc += a * b[:, None]
+    tl.store(C + split * N + rows, tl.sum(acc, axis=0), rows < N)
+
+
+@libentry()
+@triton.jit
+def _mv_merge(
+    P,
+    C,
+    N: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_SPLITS: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    splits = tl.arange(0, BLOCK_SPLITS)
+    parts = tl.load(
+        P + splits[:, None] * N + rows[None, :],
+        (splits[:, None] < SPLITS) & (rows[None, :] < N),
+        other=0,
+    )
+    tl.store(C + rows, tl.sum(parts, axis=0), rows < N)
+
+
+def _launch_column_major(inp, vec, out, n, k):
+    # Keep the physically contiguous row axis innermost. Narrow matrices lack
+    # row tiles; splitting K supplies more work without growing the UB tile.
+    block_n = 16 if n <= 64 else 64
+    block_k = 128 if block_n == 16 else 64
+    row_tiles = triton.cdiv(n, block_n)
+    target_splits = triton.cdiv(32, row_tiles)
+    chunk_k = triton.cdiv(k, target_splits * block_k) * block_k
+    splits = triton.cdiv(k, chunk_k)
+    partial = (
+        torch.empty((splits, n), device=out.device, dtype=torch.float32)
+        if splits > 1
+        else out
+    )
+    _mv_column_major[(row_tiles, splits)](
+        inp,
+        vec,
+        partial,
+        n,
+        k,
+        inp.stride(1),
+        vec.stride(0),
+        block_n,
+        block_k,
+        chunk_k,
+    )
+    if splits > 1:
+        _mv_merge[(triton.cdiv(n, 128),)](
+            partial, out, n, splits, 128, triton.next_power_of_2(splits)
+        )
+
+
 def mv(inp, vec):
     logger.debug("GEMS_ASCEND MV")
     assert inp.shape[1] == vec.shape[0], "incompatible dimensions"
@@ -360,6 +442,8 @@ def mv(inp, vec):
     with torch_device_fn.device(inp.device):
         if _can_launch_column_mv(inp, vec):
             _launch_column_mv(inp, vec, out, N, M)
+        elif inp.stride(0) == 1 and inp.stride(1) != 1 and N <= 64 * _MV_MAX_GRID:
+            _launch_column_major(inp, vec, out, N, M)
         else:
             _launch_general_mv(inp, vec, out)
     return out
